@@ -45,8 +45,15 @@ const FORM_COLOURS = {
 } as const;
 
 function FormSparkline({ form }: { form: string }) {
-  // Take the last 5 characters of the form string
-  const chars = form.slice(-5).split('') as Array<keyof typeof FORM_COLOURS>;
+  // Take the last 5 characters of the form string, keep only valid result chars.
+  const chars = form
+    .slice(-5)
+    .split('')
+    .filter((c): c is keyof typeof FORM_COLOURS => c in FORM_COLOURS);
+
+  // Pre-season: no matches played yet → form is empty → render nothing.
+  if (chars.length === 0) return null;
+
   const w = chars.length * 9 - 2; // 5 dots × 9px spacing − trailing gap
 
   return (
@@ -196,9 +203,10 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
   return (
     <div className="rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 overflow-hidden">
       <table className="w-full text-xs border-collapse" style={{ tableLayout: 'fixed' }}>
+        {/* col order: # | Club (flex) | P | W | D | L | GD | Form | Pts */}
         <colgroup>
           <col style={{ width: '26px' }} />
-          <col />                          {/* Club name — stretches */}
+          <col />
           <col style={{ width: '26px' }} />
           <col style={{ width: '26px' }} />
           <col style={{ width: '26px' }} />
