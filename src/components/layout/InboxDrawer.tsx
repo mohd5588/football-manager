@@ -4,27 +4,31 @@
  * The right-side action drawer — "The Inbox".
  *
  * Two tabs:
- *   1. Tactical — MatchReport.narrativeSummary strings rendered as Ticket cards.
- *      Each narrative line is pre-authored by the Worker; the UI only categorises
- *      and formats it. Categorisation is a keyword heuristic (no Worker involvement).
+ *   1. Tactical — one card per completed match. Shows score, clubs, scorers,
+ *      xG bar, and any narrative lines the Worker generated.
+ *      Works correctly even when narrativeSummary is empty.
  *
- *   2. Scouting — Phase 5 placeholder. The tab renders an empty state with a
- *      message. Phase 5 will add ScoutReport types and proper cards here.
+ *   2. Scouting — Phase 5 placeholder.
  *
  * State sources:
- *   - inboxStore → items (MatchReport array), unread counts
- *   - uiStore    → selectPlayer (write) when a player name is tapped
- *
- * Architecture:
- *   Pure read + local UI state (activeTab). No service or worker calls.
+ *   - inboxStore  → items (MatchReport array), unread counts
+ *   - gameStore   → clubs + players (needed to resolve names from IDs)
+ *   - uiStore     → selectPlayer (write) when a player name is tapped
  */
 
 import React, { useState } from 'react';
-import { useInboxStore, selectInboxItems, selectUnreadCount, type InboxItem } from '../../store/inboxStore';
+import {
+  useInboxStore,
+  selectInboxItems,
+  selectUnreadCount,
+  type InboxItem,
+} from '../../store/inboxStore';
+import { useGameStore, selectGameState } from '../../store/gameStore';
 import { useUiStore } from '../../store/uiStore';
+import type { MatchEvent } from '../../types';
 
 // ---------------------------------------------------------------------------
-// Ticket categorisation (heuristic — pure UI, no Worker involvement)
+// Ticket categorisation (keyword heuristic — pure UI, no Worker involvement)
 // ---------------------------------------------------------------------------
 
 type TicketCategory =
@@ -35,9 +39,9 @@ type TicketCategory =
   | 'general';
 
 interface TicketMeta {
-  label:   string;
-  dot:     string; // Tailwind bg class
-  tag:     string; // Tailwind bg + text classes
+  label: string;
+  dot:   string; // Tailwind bg class
+  tag:   string; // Tailwind bg + text classes
 }
 
 const CATEGORY_META: Record<TicketCategory, TicketMeta> = {
@@ -64,11 +68,11 @@ function categorise(text: string): TicketCategory {
 }
 
 // ---------------------------------------------------------------------------
-// Relative time
+// Relative time helper
 // ---------------------------------------------------------------------------
 
 function relativeTime(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
+  const diff  = Date.now() - new Date(iso).getTime();
   const mins  = Math.floor(diff / 60_000);
   const hours = Math.floor(diff / 3_600_000);
   const days  = Math.floor(diff / 86_400_000);
@@ -80,71 +84,197 @@ function relativeTime(iso: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-components
+// xG mini-bar
+// ---------------------------------------------------------------------------
+// A tiny two-tone bar showing home xG vs away xG at a glance.
+// Total width is fixed; each side's fill is proportional to its share.
+
+function XgBar({ homeXg, awayXg }: { homeXg: number; awayXg: number }) {
+  const total = homeXg + awayXg;
+  if (total === 0) return null;
+  const homePct = Math.round((homeXg / total) * 100);
+  const awayPct = 100 - homePct;
+
+  return (
+    <div className="flex items-center gap-1 mt-1.5">
+      <span className="text-[9px] text-gray-400 w-6 text-right">{homeXg.toFixed(1)}</span>
+      <div className="flex-1 flex rounded-full overflow-hidden h-1">
+        <div className="bg-blue-400" style={{ width: `${homePct}%` }} />
+        <div className="bg-orange-400 flex-1" style={{ width: `${awayPct}%` }} />
+      </div>
+      <span className="text-[9px] text-gray-400 w-6">{awayXg.toFixed(1)}</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Goal event line  e.g.  "⚽ Liam Carr  34'  (NOR)"
+// ---------------------------------------------------------------------------
+
+function GoalLine({ event, playerName, clubShortName }: {
+  event:          MatchEvent;
+  playerName:     string;
+  clubShortName:  string;
+}) {
+  const icon = event.type === 'penalty_saved' ? '🧤' : '⚽';
+  return (
+    <div className="flex items-baseline gap-1 text-[10px] text-gray-500 dark:text-gray-400 pl-1">
+      <span>{icon}</span>
+      <span className="flex-1 truncate">{playerName}</span>
+      <span className="text-gray-400 dark:text-gray-600 flex-shrink-0">{event.minute}′</span>
+      <span className="text-gray-400 dark:text-gray-600 flex-shrink-0">({clubShortName})</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tactical match report card
 // ---------------------------------------------------------------------------
 
 function TacticalTicket({ item }: { item: InboxItem }) {
-  const markRead = useInboxStore((s) => s.markRead);
+  const gameState = useGameStore(selectGameState);
+  const markRead  = useInboxStore((s) => s.markRead);
+  const selectPlayer = useUiStore((s) => s.selectPlayer);
 
-  // Each narrative string becomes one card; render all lines from the report
-  const lines = item.report.narrativeSummary;
-  if (lines.length === 0) return null;
+  const { report } = item;
 
-  // Use the first line as the title, rest as body text
+  // Resolve club objects from the game state.
+  // Falls back to abbreviated IDs if state hasn't loaded yet.
+  const homeClub = gameState?.clubs[report.homeStats.clubId];
+  const awayClub = gameState?.clubs[report.awayStats.clubId];
+
+  const homeGoals = report.homeStats.goals;
+  const awayGoals = report.awayStats.goals;
+  const homeXg    = report.homeStats.xG ?? 0;
+  const awayXg    = report.awayStats.xG ?? 0;
+
+  // Collect goal events in chronological order.
+  const goalEvents = [...report.events]
+    .filter((e) => e.type === 'goal')
+    .sort((a, b) => a.minute - b.minute);
+
+  // Narrative lines from the worker (may be empty — that's fine).
+  const lines = report.narrativeSummary ?? [];
   const [title, ...rest] = lines;
   const body = rest.join(' ');
-  const category = categorise(title + ' ' + body);
+  const category = lines.length > 0 ? categorise(title + ' ' + body) : 'general';
   const meta = CATEGORY_META[category];
 
   return (
-    <button
-      onClick={() => markRead(item.report.fixtureId)}
+    <div
       className={`w-full text-left rounded-lg border transition-colors
         ${item.isRead
           ? 'bg-gray-50 dark:bg-gray-800/50 border-gray-100 dark:border-gray-800'
           : 'bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 shadow-[0_1px_3px_rgba(0,0,0,0.04)]'
-        }
-        hover:bg-gray-50 dark:hover:bg-gray-800 p-2.5`}
+        }`}
     >
-      {/* Header row */}
-      <div className="flex items-start gap-2 mb-1.5">
-        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1 ${meta.dot}`} />
-        <span className={`flex-1 text-xs font-medium leading-snug
-          ${item.isRead
-            ? 'text-gray-500 dark:text-gray-400'
-            : 'text-gray-800 dark:text-gray-200'
-          }`}>
-          {title}
-        </span>
-        {!item.isRead && (
-          <span className="w-1.5 h-1.5 rounded-full bg-blue-500 flex-shrink-0 mt-1" />
-        )}
-      </div>
+      {/* ── Scoreboard ─────────────────────────────────────────────── */}
+      <button
+        onClick={() => markRead(report.fixtureId)}
+        className="w-full px-3 pt-2.5 pb-1 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition-colors rounded-t-lg"
+      >
+        <div className="flex items-center justify-between gap-2">
+          {/* Home team */}
+          <span className={`flex-1 text-left text-xs truncate
+            ${homeGoals > awayGoals
+              ? 'font-semibold text-gray-800 dark:text-gray-100'
+              : 'text-gray-500 dark:text-gray-400'}`}>
+            {homeClub?.shortName ?? homeClub?.name ?? '?'}
+          </span>
 
-      {/* Body */}
-      {body && (
-        <p className="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed mb-2 pl-3.5">
-          {body}
-        </p>
+          {/* Score */}
+          <span className="flex-shrink-0 text-sm font-bold text-gray-800 dark:text-gray-100 tabular-nums">
+            {homeGoals} – {awayGoals}
+          </span>
+
+          {/* Away team */}
+          <span className={`flex-1 text-right text-xs truncate
+            ${awayGoals > homeGoals
+              ? 'font-semibold text-gray-800 dark:text-gray-100'
+              : 'text-gray-500 dark:text-gray-400'}`}>
+            {awayClub?.shortName ?? awayClub?.name ?? '?'}
+          </span>
+        </div>
+
+        {/* xG bar */}
+        <XgBar homeXg={homeXg} awayXg={awayXg} />
+      </button>
+
+      {/* ── Goal events ────────────────────────────────────────────── */}
+      {goalEvents.length > 0 && (
+        <div className="px-3 py-1.5 border-t border-gray-100 dark:border-gray-800 flex flex-col gap-0.5">
+          {goalEvents.map((event, i) => {
+            const player    = gameState?.players[event.playerId];
+            const club      = gameState?.clubs[event.clubId];
+            const shortName = player?.name?.split(' ').pop() ?? '—';
+            return (
+              <button
+                key={i}
+                onClick={() => player && selectPlayer(player.id)}
+                className="w-full text-left hover:opacity-70 transition-opacity"
+              >
+                <GoalLine
+                  event={event}
+                  playerName={shortName}
+                  clubShortName={club?.shortName ?? '?'}
+                />
+              </button>
+            );
+          })}
+        </div>
       )}
 
-      {/* Footer */}
-      <div className="flex items-center justify-between pl-3.5">
-        <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${meta.tag}`}>
-          {meta.label}
-        </span>
-        <span className="text-[10px] text-gray-400 dark:text-gray-500">
-          {relativeTime(item.receivedAt)}
-        </span>
-      </div>
-    </button>
+      {/* ── Narrative summary (worker-generated text) ──────────────── */}
+      {lines.length > 0 && (
+        <div className="px-3 py-2 border-t border-gray-100 dark:border-gray-800">
+          <div className="flex items-start gap-2 mb-1">
+            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1 ${meta.dot}`} />
+            <span className={`flex-1 text-[11px] font-medium leading-snug
+              ${item.isRead
+                ? 'text-gray-500 dark:text-gray-400'
+                : 'text-gray-700 dark:text-gray-300'}`}>
+              {title}
+            </span>
+            {!item.isRead && (
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-500 flex-shrink-0 mt-1" />
+            )}
+          </div>
+          {body && (
+            <p className="text-[10px] text-gray-400 dark:text-gray-500 leading-relaxed pl-3.5">
+              {body}
+            </p>
+          )}
+          <div className="flex items-center justify-between mt-1.5 pl-3.5">
+            <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${meta.tag}`}>
+              {meta.label}
+            </span>
+            <span className="text-[10px] text-gray-400 dark:text-gray-500">
+              {relativeTime(item.receivedAt)}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* ── Timestamp when there's no narrative ────────────────────── */}
+      {lines.length === 0 && (
+        <div className="px-3 pb-2 pt-1 flex justify-end">
+          <span className="text-[10px] text-gray-400 dark:text-gray-500">
+            {relativeTime(item.receivedAt)}
+          </span>
+        </div>
+      )}
+    </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Empty / placeholder states
+// ---------------------------------------------------------------------------
+
 function EmptyState({ message }: { message: string }) {
   return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-2 py-10 text-center">
-      <div className="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-gray-300 dark:text-gray-600 text-lg">
+    <div className="flex-1 flex flex-col items-center justify-center gap-2 py-10 text-center px-4">
+      <div className="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-lg">
         ✓
       </div>
       <p className="text-xs text-gray-400 dark:text-gray-500">{message}</p>
@@ -155,7 +285,7 @@ function EmptyState({ message }: { message: string }) {
 function ScoutingPlaceholder() {
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-2 py-10 px-4 text-center">
-      <div className="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-gray-400 dark:text-gray-600 text-sm">
+      <div className="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-sm">
         🔍
       </div>
       <p className="text-xs font-medium text-gray-600 dark:text-gray-400">Scouting unlocks in Phase 5</p>
@@ -179,12 +309,14 @@ export function InboxDrawer() {
   const unreadCount = useInboxStore(selectUnreadCount);
   const markAllRead = useInboxStore((s) => s.markAllRead);
 
-  const tacticalItems = items.filter((i) => i.report.narrativeSummary.length > 0);
+  // Show ALL items that have a real fixture ID — no longer filtered by narrativeSummary
+  // length, so score-only reports appear even if the worker writes no narrative text.
+  const tacticalItems = items.filter((i) => !!i.report.fixtureId);
 
   return (
     <aside className="w-64 flex-shrink-0 flex flex-col bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-800 h-full">
 
-      {/* Header */}
+      {/* ── Header ───────────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-3.5 py-2.5 border-b border-gray-100 dark:border-gray-800 flex-shrink-0">
         <span className="text-sm">📋</span>
         <span className="text-xs font-medium text-gray-800 dark:text-gray-200">The Inbox</span>
@@ -204,7 +336,7 @@ export function InboxDrawer() {
         )}
       </div>
 
-      {/* Tabs */}
+      {/* ── Tabs ─────────────────────────────────────────────────────── */}
       <div className="flex border-b border-gray-100 dark:border-gray-800 flex-shrink-0">
         {(['tactical', 'scouting'] as DrawerTab[]).map((tab) => (
           <button
@@ -224,11 +356,11 @@ export function InboxDrawer() {
         ))}
       </div>
 
-      {/* Body */}
+      {/* ── Body ─────────────────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto p-2.5 flex flex-col gap-2">
         {activeTab === 'tactical' && (
           tacticalItems.length === 0
-            ? <EmptyState message="No match reports yet — simulate a game to see tactical insights" />
+            ? <EmptyState message="No match reports yet — simulate a game to see results here" />
             : tacticalItems.map((item) => (
                 <TacticalTicket key={item.report.fixtureId} item={item} />
               ))
