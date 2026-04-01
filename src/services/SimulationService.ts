@@ -20,6 +20,20 @@
  *   (response as any).state ?? (response as any).payload
  * so this service works with the real worker output today, and will
  * continue to work if the worker is updated to match types.ts later.
+ *
+ * BUG FIX (Phase 4):
+ * ------------------
+ * The constructor previously called workerBridge.onSyncState() TWICE —
+ * once for SYNC_STATE handling and once for MATCH_RESULT handling.
+ *
+ * If onSyncState() is a setter (last-writer-wins semantics, which is the
+ * common pattern for a single-listener bridge), the second call silently
+ * replaced the first. Result: the SYNC_STATE → applyGameState path was
+ * dead, so Zustand never updated after simulating a day and the simulate
+ * button appeared to do nothing.
+ *
+ * Fix: a single onSyncState() registration that dispatches to both
+ * handlers. MATCH_RESULT reports now correctly reach the inboxStore.
  */
 
 import type {
@@ -112,25 +126,38 @@ class SimulationService implements ISimulationService {
   private currentJobId: string | null = null;
 
   constructor() {
-    // ── Global SYNC_STATE handler ──────────────────────────────────────
-    // Every time the worker pushes new state (after a match, after a save,
-    // during fast-forward) this fires and updates Zustand immediately.
+    // ── Single unified worker-message handler ──────────────────────────
+    //
+    // IMPORTANT: only register onSyncState ONCE.
+    //
+    // If it is a setter (last-writer-wins), two registrations would silently
+    // drop the first. The previous code registered it twice — once for
+    // SYNC_STATE and once for MATCH_RESULT — which killed the SYNC_STATE →
+    // Zustand update path and broke the simulate button entirely.
+    //
+    // Every response type is handled inside this single callback so we never
+    // risk that silent-replacement bug again.
     workerBridge.onSyncState((response: WorkerResponse) => {
+
+      // ── SYNC_STATE: push new world state into Zustand ──────────────
       if (isSyncStateResponse(response)) {
         const raw = extractState(response);
         if (raw) this.applyGameState(raw);
       }
-    });
 
-    // ── Global MATCH_RESULT handler ────────────────────────────────────
-    // After each simulated game the worker emits a MATCH_RESULT containing
-    // a MatchReport. We route it to the inboxStore so it appears in the
-    // Tactical tab of the Inbox drawer.
-    workerBridge.onSyncState((response: WorkerResponse) => {
+      // ── MATCH_RESULT: route report to the inbox ────────────────────
+      //
+      // The worker sends MATCH_RESULT alongside SYNC_STATE after every
+      // simulated game. We extract the MatchReport and push it to the
+      // inboxStore so it appears as a Tactical Insight ticket in the Inbox.
+      //
+      // Field-name normalisation: types.ts uses `.payload`; the current
+      // worker emits `.report`. Accept either.
       if (isMatchResultResponse(response)) {
-        const r = response as Record<string, unknown>;
+        const r      = response as Record<string, unknown>;
         const report = (r.payload ?? r.report) as Record<string, unknown> | undefined;
         if (report) {
+          // Dynamic import keeps SimulationService free of a hard circular dep.
           import('../store/inboxStore').then(({ useInboxStore }) => {
             useInboxStore.getState().pushReport(report as any);
           });
@@ -169,8 +196,10 @@ class SimulationService implements ISimulationService {
     useGameStore.getState().setSimulating(true);
 
     try {
+      // workerBridge.send() resolves when the terminal SYNC_STATE arrives.
+      // Any MATCH_RESULT messages emitted before that are handled by the
+      // unified onSyncState listener above (inbox routing).
       await workerBridge.send({ type: 'SIM_DAY', payload: {} });
-      // Worker sends SYNC_STATE automatically — the handler above updates Zustand.
     } finally {
       useGameStore.getState().setSimulating(false);
     }

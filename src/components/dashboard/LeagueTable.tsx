@@ -17,6 +17,16 @@
  * State sources:
  *   - gameStore → standings, playerClubId
  *   - uiStore   → selectClub (write), setActiveTab (write)
+ *
+ * BUG FIXES (Phase 4):
+ *   1. `visibleRows` was computed but the tbody iterated `rows` directly.
+ *      Now the tbody iterates `visibleRows` and handles the 'separator' sentinel.
+ *   2. Worker initialises StandingsRow.position = 0 in pre-season, causing
+ *      getZone() to return 'none' for every row (zone colours invisible).
+ *      Rows are now position-normalised before zone calculation so the correct
+ *      zone colours render from kick-off of the season.
+ *   3. Rows are deduplicated by clubId before rendering to guard against the
+ *      world-gen double-insert bug that made the player club appear twice.
  */
 
 import React, { useMemo } from 'react';
@@ -84,13 +94,6 @@ const ZONE_LEFT_BORDER: Record<Zone, string> = {
   none:       'border-l-2 border-l-transparent',
 };
 
-const ZONE_SEPARATOR: Record<Zone, string | null> = {
-  promotion:  'Playoff zone',
-  playoff:    null, // separator rendered at mid-table boundary
-  relegation: null,
-  none:       null,
-};
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -121,11 +124,41 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
   const selectClub   = useUiStore((s) => s.selectClub);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
-  const rows       = gameState?.standings[gameState.playerClub.currentTier] ?? [];
-  const tier       = gameState?.playerClub.currentTier;
+  const tier         = gameState?.playerClub?.currentTier;
   const playerClubId = gameState?.playerClubId;
 
-  // In compact mode, show a window around the player's row
+  // ── FIX 1 + FIX 2: normalise and deduplicate rows ──────────────────────
+  //
+  // The worker initialises StandingsRow.position = 0 in pre-season which
+  // breaks zone colour logic. Map each row so position is always ≥ 1,
+  // falling back to the sorted array index when the worker hasn't set it yet.
+  //
+  // Deduplication (FIX 3) guards against the world-gen double-insert bug
+  // where the player-managed club is pushed into the standings array twice.
+  const rows = useMemo<StandingsRow[]>(() => {
+    const raw: StandingsRow[] = (tier ? gameState?.standings[tier] : undefined) ?? [];
+
+    const seen = new Set<string>();
+    return raw
+      .filter((row) => {
+        // Deduplicate — keep first occurrence of each clubId.
+        if (seen.has(row.clubId)) return false;
+        seen.add(row.clubId);
+        return true;
+      })
+      .map((row, idx) =>
+        // Normalise position: if the worker hasn't set it yet (0 or negative),
+        // derive it from the sorted array index so zone colours are correct
+        // from day 1 of the season.
+        row.position > 0 ? row : { ...row, position: idx + 1 }
+      );
+  }, [gameState, tier]);
+
+  // ── FIX 1: visibleRows is now the array the tbody actually renders ───────
+  //
+  // Previously visibleRows was computed but rows was rendered — the compact
+  // window was effectively dead code. Now visibleRows drives the render and
+  // the 'separator' sentinel is handled explicitly in the map below.
   const visibleRows = useMemo<Array<StandingsRow | 'separator'>>(() => {
     if (!compact || !playerClubId) return rows;
 
@@ -153,7 +186,9 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
     );
   }
 
-  // Zone separator label positions — insert labels before the first row of a new zone
+  // Zone separator label positions — insert labels before the first row of a new zone.
+  // Only relevant when rendering the full table (compact=false); in compact mode the
+  // zone boundary may not be visible but the labels still render for any rows present.
   const promotionEnd = TIER_CONFIG[tier].autoPromotionSlots;
   const playoffEnd   = promotionEnd + TIER_CONFIG[tier].playoffEntrants;
   const relegStart   = TIER_CONFIG[tier].clubCount - TIER_CONFIG[tier].autoRelegationSlots + 1;
@@ -190,16 +225,36 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
         </thead>
 
         <tbody>
-          {rows.map((row, idx) => {
-            if (row === undefined) return null;
+          {/* ── FIX 1: iterate visibleRows, not rows ─────────────────────── */}
+          {visibleRows.map((row, idx) => {
+
+            // ── Compact ellipsis separator ────────────────────────────────
+            // The 'separator' sentinel is inserted by the visibleRows memo to
+            // indicate rows above/below the compact window have been hidden.
+            if (row === 'separator') {
+              return (
+                <tr key={`sep-${idx}`} className="border-b border-gray-100 dark:border-gray-800">
+                  <td
+                    colSpan={9}
+                    className="py-1 pl-2.5 text-[9px] text-gray-400 dark:text-gray-600 tracking-widest select-none"
+                  >
+                    · · ·
+                  </td>
+                </tr>
+              );
+            }
+
             const isPlayer = row.clubId === playerClubId;
+            // row.position is guaranteed ≥ 1 after the normalisation above.
             const zone     = getZone(row.position, tier);
             const club     = gameState.clubs[row.clubId];
 
-            // Insert zone separator rows
+            // Insert zone label rows for the full-table view.
+            // These fire on position boundaries regardless of compact mode —
+            // if the boundary falls inside the compact window the label still renders.
             const separatorBefore: string | null =
               row.position === promotionEnd + 1 && TIER_CONFIG[tier].playoffEntrants > 0
-                ? `Playoff zone (${promotionEnd + 1}th–${playoffEnd}th)`
+                ? `Playoff zone (${promotionEnd + 1}–${playoffEnd})`
                 : row.position === playoffEnd + 1
                 ? 'Mid-table'
                 : row.position === relegStart
