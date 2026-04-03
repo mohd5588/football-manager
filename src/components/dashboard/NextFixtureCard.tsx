@@ -44,12 +44,38 @@ const FORM_COLOURS: Record<string, string> = {
   L: '#dc2626',
 };
 
+/**
+ * Tiny 5-dot form sparkline — raw SVG, no library.
+ *
+ * FIX: guard against empty form string (pre-season / new club).
+ * An empty string produces `chars.length * 9 - 2 = -2` which SVG rejects.
+ * Return null until at least one result exists.
+ */
 function MiniForm({ form }: { form: string }) {
-  const chars = form.slice(-5).split('');
+  const chars = form
+    .slice(-5)
+    .split('')
+    .filter((c): c is keyof typeof FORM_COLOURS => c in FORM_COLOURS);
+
+  if (chars.length === 0) return null;
+
+  const w = chars.length * 9 - 2;
+
   return (
-    <svg width={chars.length * 9 - 2} height={8} style={{ display: 'block', overflow: 'visible' }}>
+    <svg
+      width={w}
+      height={8}
+      viewBox={`0 0 ${w} 8`}
+      style={{ display: 'block', overflow: 'visible' }}
+    >
       {chars.map((c, i) => (
-        <circle key={i} cx={i * 9 + 4} cy={4} r={3} fill={FORM_COLOURS[c] ?? FORM_COLOURS.D} />
+        <circle
+          key={i}
+          cx={i * 9 + 4}
+          cy={4}
+          r={3}
+          fill={FORM_COLOURS[c] ?? FORM_COLOURS.D}
+        />
       ))}
     </svg>
   );
@@ -87,22 +113,16 @@ function ReadinessChip({ label, variant }: Chip) {
 function deriveReadinessChips(
   gameState: NonNullable<ReturnType<typeof selectGameState>>
 ): Chip[] {
-  const tactics   = gameState.playerClub.tactics;
-  const startXI   = tactics.startingXI;
-  const players   = gameState.players;
+  const tactics  = gameState.playerClub.tactics;
+  const startXI  = tactics.startingXI;
+  const players  = gameState.players;
 
-  // 1. Formation set — XI has 11 players
   const formationOk = startXI.length === 11;
 
-  // 2. Injuries in XI
   const injuredInXI = startXI.filter((pid) => {
     const p = players[pid];
     return p && (p.status === 'injured' || p.status === 'suspended');
   });
-
-  // 3. Tactics — we consider mentality + formation to be "set" if XI is full
-  //    Phase 5: compare against a "last saved" snapshot for drift detection.
-  const tacticsOk = formationOk;
 
   const chips: Chip[] = [
     {
@@ -120,8 +140,8 @@ function deriveReadinessChips(
   }
 
   chips.push({
-    label:   tacticsOk ? 'Tactics set' : 'Tactics missing',
-    variant: tacticsOk ? 'good' : 'warn',
+    label:   formationOk ? 'Tactics set' : 'Tactics missing',
+    variant: formationOk ? 'good' : 'warn',
   });
 
   return chips;
@@ -171,18 +191,18 @@ export function NextFixtureCard() {
     );
   }
 
-  const isHome      = fixture.homeClubId === club.id;
-  const opponentId  = isHome ? fixture.awayClubId : fixture.homeClubId;
-  const opponent    = gameState.clubs[opponentId];
-  const tierRows    = gameState.standings[club.currentTier] ?? [];
+  const isHome     = fixture.homeClubId === club.id;
+  const opponentId = isHome ? fixture.awayClubId : fixture.homeClubId;
+  const opponent   = gameState.clubs[opponentId];
+  const tierRows   = gameState.standings[club.currentTier] ?? [];
 
-  const myRow       = tierRows.find((r) => r.clubId === club.id);
-  const oppRow      = tierRows.find((r) => r.clubId === opponentId);
+  const myRow  = tierRows.find((r) => r.clubId === club.id);
+  const oppRow = tierRows.find((r) => r.clubId === opponentId);
 
-  const homeClub    = isHome ? club : opponent;
-  const awayClub    = isHome ? opponent : club;
-  const homeRow     = isHome ? myRow : oppRow;
-  const awayRow     = isHome ? oppRow : myRow;
+  const homeClub = isHome ? club : opponent;
+  const awayClub = isHome ? opponent : club;
+  const homeRow  = isHome ? myRow : oppRow;
+  const awayRow  = isHome ? oppRow : myRow;
 
   const chips = deriveReadinessChips(gameState);
 
@@ -191,6 +211,7 @@ export function NextFixtureCard() {
 
       {/* Matchup */}
       <div className="flex items-center justify-center gap-4 px-5 pt-4 pb-3">
+
         {/* Home side */}
         <div className="flex flex-col items-center gap-1.5 flex-1">
           <TeamBadge shortName={homeClub?.shortName ?? '??'} isHome />
@@ -198,7 +219,7 @@ export function NextFixtureCard() {
             {homeClub?.name ?? 'Home'}
           </span>
           {homeRow && (
-            <div className="flex justify-center">
+            <div className="flex justify-center min-h-[8px]">
               <MiniForm form={homeRow.form} />
             </div>
           )}
@@ -219,7 +240,7 @@ export function NextFixtureCard() {
             {awayClub?.name ?? 'Away'}
           </span>
           {awayRow && (
-            <div className="flex justify-center">
+            <div className="flex justify-center min-h-[8px]">
               <MiniForm form={awayRow.form} />
             </div>
           )}

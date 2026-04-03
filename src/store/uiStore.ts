@@ -25,6 +25,7 @@ export type ModalId =
   | 'loadGame'
   | 'exportJson'
   | 'importJson'
+  | 'simSettings'
   | 'settings'
   | 'playerProfile'
   | 'clubProfile'
@@ -69,6 +70,8 @@ interface UiStoreState {
   /** The modal currently rendered on screen (null = none). */
   openModal: ModalId;
 
+  simMode: 'to_fixture' | 'one_day' | 'matchweek';
+
   /** Player ID shown in the slide-in profile drawer. */
   selectedPlayerId: string | null;
 
@@ -85,7 +88,8 @@ interface UiStoreState {
 interface UiStoreActions {
   setActiveTab: (tab: NavTab) => void;
   openModal: (id: ModalId) => void;
-  closeModal: () => void;
+      closeModal: () => void;
+  setSimMode: (mode: 'to_fixture' | 'one_day' | 'matchweek') => void;
   selectPlayer: (playerId: string | null) => void;
   selectClub: (clubId: string | null) => void;
   setActiveSaveSlot: (index: number) => void;
@@ -100,6 +104,7 @@ interface UiStoreActions {
 const INITIAL_STATE: UiStoreState = {
   activeTab: 'dashboard',
   openModal: null,
+      simMode: 'to_fixture',
   selectedPlayerId: null,
   selectedClubId: null,
   activeSaveSlotIndex: 0,
@@ -122,6 +127,8 @@ export const useUiStore = create<UiStoreState & UiStoreActions>()(
 
       openModal: (id) =>
         set({ openModal: id }, false, 'openModal'),
+
+      setSimMode: (mode) => set({ simMode: mode }, false, 'setSimMode'),
 
       closeModal: () =>
         set({ openModal: null }, false, 'closeModal'),
