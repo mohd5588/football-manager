@@ -1,20 +1,27 @@
 /**
  * sim.worker.ts — The Simulation Engine (Background Thread)
  *
- * Runs on a completely separate thread from the UI.
- * Communicates ONLY via self.postMessage() and self.onmessage.
- *
- * Phase 4 additions vs the stub:
- *   ✅ Round-robin fixture schedule generated on INIT_LEAGUE
- *   ✅ Probabilistic match engine (Poisson-based goals)
- *   ✅ Standings updated and re-sorted after every simulated match
- *   ✅ MATCH_RESULT emitted for every completed game
- *   ✅ playerClubId field name fixed (was: managerClubId)
- *   ✅ buildInitialStandings positions are 1-indexed (was: 0-indexed)
- *   ✅ SIM_TO_DATE reads targetDate from action.payload (per types.ts contract)
+ * Phase 6 additions:
+ *   ✅ Matchday revenue added to home club's balance after every match
+ *   ✅ Weekly wage bill deducted from every club every Monday
+ *   ✅ AI transfer bids generated on the 1st of each month
+ *   ✅ MAKE_TRANSFER_OFFER — manager buys a player from an AI club
+ *   ✅ ACCEPT_BID — manager accepts an AI club's offer for their player
+ *   ✅ REJECT_BID — manager rejects a bid, removes it from pendingBids
+ *   ✅ recalculateWageBill() keeps club.finances.wageBill accurate after transfers
  */
 
-import { Tier, type SerializedGameState, type Fixture, type MatchReport, type MatchEvent, type ClubMatchStats, type PlayerMatchRating } from '../types';
+import {
+  Tier,
+  TIER_CONFIG,
+  type SerializedGameState,
+  type Fixture,
+  type MatchReport,
+  type MatchEvent,
+  type ClubMatchStats,
+  type PlayerMatchRating,
+  type TransferBid,
+} from '../types';
 import { generateWorld } from './engine/worldGen';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,6 +83,111 @@ function isBefore(a: string, b: string): boolean {
   return a < b;
 }
 
+/** Returns true if the ISO date falls on a Monday (UTC). */
+function isMonday(iso: string): boolean {
+  return parseDate(iso).getUTCDay() === 1;
+}
+
+/** Returns true if the ISO date is the 1st day of a month. */
+function isFirstOfMonth(iso: string): boolean {
+  return iso.endsWith('-01');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Economy Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Recalculate a club's wageBill as the sum of all its players' weeklyWage.
+ * Called after any transfer so the sidebar finance strip stays accurate.
+ */
+function recalculateWageBill(clubId: string): void {
+  if (!state) return;
+  const club = state.clubs[clubId];
+  if (!club) return;
+  const total = Object.values(state.players)
+    .filter(p => p.clubId === clubId)
+    .reduce((sum, p) => sum + (p.weeklyWage ?? p.currentAbility * 200), 0);
+  club.finances.wageBill = total;
+}
+
+/**
+ * Deduct each club's weekly wage bill on Mondays.
+ * Plain English: every Monday the game "pays the players" from the club's bank.
+ */
+function processEndOfDay(date: string): void {
+  if (!state) return;
+  if (isMonday(date)) {
+    for (const club of Object.values(state.clubs)) {
+      club.finances.balance -= club.finances.wageBill;
+    }
+  }
+}
+
+/**
+ * Generate AI transfer bids targeting the manager's best players.
+ * Called on the 1st of each month during regular_season.
+ *
+ * Logic:
+ *  - Any manager player with ability > tierMean + 5 is "attractive"
+ *  - Each attractive player has a 20% chance of receiving a bid
+ *  - Maximum 2 new bids generated per month
+ *  - A player already receiving a bid is skipped
+ */
+function generateAIBids(): void {
+  if (!state) return;
+  if (state.phase !== 'regular_season') return;
+
+  const playerClubId = state.playerClubId;
+  const playerClub   = state.clubs[playerClubId];
+  if (!playerClub) return;
+
+  const tierMean  = TIER_CONFIG[playerClub.currentTier].meanAttributeScore;
+  const myPlayers = Object.values(state.players).filter(
+    p => p.clubId === playerClubId && p.status === 'active'
+  );
+
+  // Players that are above average for their tier — attractive to other clubs
+  const attractive = myPlayers.filter(p => p.currentAbility > tierMean + 5);
+  if (attractive.length === 0) return;
+
+  const otherClubs = Object.values(state.clubs).filter(c => c.id !== playerClubId);
+  if (otherClubs.length === 0) return;
+
+  let bidsThisMonth = 0;
+
+  for (const player of attractive) {
+    if (bidsThisMonth >= 2) break;
+
+    // 20% chance per player
+    if (Math.random() > 0.2) continue;
+
+    // Skip if there's already a pending bid for this player
+    const existingBid = (state.pendingBids ?? []).find(b => b.playerId === player.id);
+    if (existingBid) continue;
+
+    // Pick a random AI club
+    const fromClub = otherClubs[Math.floor(Math.random() * otherClubs.length)];
+
+    // Bid fee formula from spec
+    const ageFactor = player.age <= 24 ? 1.5 : player.age <= 29 ? 1.0 : 0.6;
+    const fee       = Math.round(player.currentAbility * ageFactor * 100_000);
+
+    const bid: TransferBid = {
+      id:          crypto.randomUUID(),
+      playerId:    player.id,
+      fromClubId:  fromClub.id,
+      fee,
+      weeklyWage:  player.weeklyWage ?? player.currentAbility * 200,
+      createdDate: state.currentDate,
+    };
+
+    if (!state.pendingBids) (state as any).pendingBids = [];
+    state.pendingBids.push(bid);
+    bidsThisMonth++;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Standings Builder
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +209,6 @@ function buildInitialStandings(
 
   for (const tier of Object.keys(byTier)) byTier[tier].sort();
 
-  // FIX: index + 1 so position is 1-based (was 0-based, broke zone colours)
   const makeRow = (clubId: string, index: number) => ({
     clubId,
     position:       index + 1,
@@ -124,11 +235,6 @@ function buildInitialStandings(
 // Round-Robin Fixture Generator
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Classic circle-method round-robin.
- * Keeps teams[0] fixed and rotates the rest each round.
- * Returns rounds × games as [homeId, awayId] pairs.
- */
 function generateRoundRobinRounds(teamIds: string[]): Array<Array<[string, string]>> {
   const teams = [...teamIds];
   if (teams.length % 2 !== 0) teams.push('__BYE__');
@@ -145,7 +251,6 @@ function generateRoundRobinRounds(teamIds: string[]): Array<Array<[string, strin
       }
     }
     rounds.push(games);
-    // Rotate: fix teams[0], move last to position 1
     const last = teams.pop()!;
     teams.splice(1, 0, last);
   }
@@ -153,10 +258,6 @@ function generateRoundRobinRounds(teamIds: string[]): Array<Array<[string, strin
   return rounds;
 }
 
-/**
- * Generate a complete home-and-away league schedule for all four tiers.
- * Matchweeks are spaced 7 days apart starting from startDate.
- */
 function generateFixtures(
   clubs: SerializedGameState['clubs'],
   startDate: string
@@ -207,7 +308,6 @@ function generateFixtures(
 // Match Engine
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Poisson random variable — models goals from an expected-goals value. */
 function poissonRandom(lambda: number): number {
   if (lambda <= 0) return 0;
   const L = Math.exp(-Math.min(lambda, 20));
@@ -216,11 +316,6 @@ function poissonRandom(lambda: number): number {
   return k - 1;
 }
 
-/**
- * Returns the starting XI for a club.
- * Uses the manager-set XI if exactly 11 players are selected,
- * otherwise auto-selects the 11 highest-ability active players.
- */
 function getStartingXI(clubId: string): string[] {
   const xi = state!.clubs[clubId]?.tactics?.startingXI;
   if (xi && xi.length === 11) return [...xi];
@@ -232,7 +327,6 @@ function getStartingXI(clubId: string): string[] {
     .map(p => p.id);
 }
 
-/** Average current ability of a player ID list. */
 function teamAbility(playerIds: string[]): number {
   if (!playerIds.length) return 50;
   let total = 0, count = 0;
@@ -243,7 +337,6 @@ function teamAbility(playerIds: string[]): number {
   return count > 0 ? total / count : 50;
 }
 
-/** Pick a goalscorer weighted by each player's finishing attribute. */
 function pickScorer(playerIds: string[]): string | null {
   if (!playerIds.length) return null;
   const pool = playerIds.map(id => ({
@@ -256,7 +349,6 @@ function pickScorer(playerIds: string[]): string | null {
   return pool[pool.length - 1]?.id ?? null;
 }
 
-/** Simulate a single match and return a full MatchReport. */
 function simulateMatch(fixture: Fixture): MatchReport {
   const homeId = fixture.homeClubId;
   const awayId = fixture.awayClubId;
@@ -272,7 +364,6 @@ function simulateMatch(fixture: Fixture): MatchReport {
   const homeGoals = poissonRandom(homeLambda);
   const awayGoals = poissonRandom(awayLambda);
 
-  // Goal events at unique minutes
   const usedMins = new Set<number>();
   const nextMinute = () => {
     let m = Math.floor(Math.random() * 90) + 1;
@@ -363,7 +454,6 @@ function simulateMatch(fixture: Fixture): MatchReport {
   };
 }
 
-/** Update standings after a completed match and re-sort. */
 function updateStandings(report: MatchReport, fixture: Fixture): void {
   const rows = (state!.standings as Record<string, any[]>)[fixture.tier];
   if (!rows) return;
@@ -404,7 +494,10 @@ function updateStandings(report: MatchReport, fixture: Fixture): void {
   rows.forEach((r, i) => { r.position = i + 1; });
 }
 
-/** Simulate all scheduled fixtures on `date`. Returns every MatchReport. */
+/**
+ * Simulate all scheduled matches on a given date and return the reports.
+ * Also adds matchday stadium revenue to the home club's balance.
+ */
 function simulateMatchesOnDate(date: string): MatchReport[] {
   const reports: MatchReport[] = [];
   const toPlay = Object.values(state!.fixtures)
@@ -413,14 +506,25 @@ function simulateMatchesOnDate(date: string): MatchReport[] {
   for (const fixture of toPlay) {
     fixture.status = 'completed';
     const report   = simulateMatch(fixture);
+    const attendance = 10_000 + Math.round(Math.random() * 40_000);
+
     fixture.result = {
       fixtureId:  fixture.id,
       homeGoals:  report.homeStats.goals,
       awayGoals:  report.awayStats.goals,
       homexG:     report.homeStats.xG,
       awayxG:     report.awayStats.xG,
-      attendance: 10_000 + Math.round(Math.random() * 40_000),
+      attendance,
     };
+
+    // ── Matchday revenue: home club earns 70–100% of their stadiumRevenue ──
+    // Plain English: bigger crowds (random variation) mean more ticket income.
+    const homeClub = state!.clubs[fixture.homeClubId];
+    if (homeClub) {
+      const attendanceMod = 0.7 + Math.random() * 0.3;
+      homeClub.finances.balance += Math.round(homeClub.finances.stadiumRevenue * attendanceMod);
+    }
+
     updateStandings(report, fixture);
     reports.push(report);
   }
@@ -428,7 +532,6 @@ function simulateMatchesOnDate(date: string): MatchReport[] {
   return reports;
 }
 
-/** Move pre_season → regular_season once the first match is played. */
 function updatePhase(): void {
   if (!state || state.phase !== 'pre_season') return;
   if (Object.values(state.fixtures).some(f => f.status === 'completed')) {
@@ -452,10 +555,6 @@ function handleInitLeague(action: {
 
     const seed             = config.seed ?? Date.now();
     const season           = 2025;
-    // The game clock starts one day BEFORE the first fixtures so that the
-    // first "To next fixture" / "One day" call advances into Aug 9 and
-    // correctly simulates that matchweek.  The while loop in SIM_TO_DATE is
-    // strict less-than, so currentDate must be < targetDate to run.
     const startDate        = `${season}-08-08`;
     const firstFixtureDate = `${season}-08-09`;
 
@@ -472,11 +571,8 @@ function handleInitLeague(action: {
     clubs[playerClubId].isPlayerManaged = true;
 
     const standings = buildInitialStandings(clubs);
-    // Fixtures start on firstFixtureDate (Aug 9), not startDate (Aug 8)
     const fixtures  = generateFixtures(clubs, firstFixtureDate);
 
-    // Cast to any to allow the extra 'seed' field (not in SerializedGameState
-    // by design, but kept for save/load compatibility).
     (state as any) = {
       saveId:          crypto.randomUUID(),
       saveName:        'New Game',
@@ -493,8 +589,9 @@ function handleInitLeague(action: {
         [Tier.EPL]: null, [Tier.Championship]: null,
         [Tier.LeagueOne]: null, [Tier.LeagueTwo]: null,
       },
-      playerClubId,          // FIX: was 'managerClubId' — broke all player-club lookups
+      playerClubId,
       nonLeagueClubIds: [],
+      pendingBids:      [],   // ← Phase 6: initialise empty bid list
       lastUpdated:      startDate,
     };
 
@@ -520,10 +617,10 @@ function handleSimDay(action: { type: 'SIM_DAY'; jobId: string }): void {
     state.lastUpdated = state.currentDate;
 
     const reports = simulateMatchesOnDate(state.currentDate);
+    processEndOfDay(state.currentDate);
+    if (isFirstOfMonth(state.currentDate)) generateAIBids();
     updatePhase();
 
-    // Emit MATCH_RESULT for every game today — one day = at most one full
-    // matchweek across all tiers (~46 games), which is manageable.
     for (const report of reports) {
       sendMatchResult(jobId, report);
     }
@@ -539,11 +636,10 @@ async function handleSimToDate(action: {
   type:       'SIM_TO_DATE';
   jobId:      string;
   payload?:   { targetDate: string; maxDays?: number };
-  targetDate?: string; // legacy flat field — accepted for compat
+  targetDate?: string;
 }): Promise<void> {
   const { jobId } = action;
 
-  // FIX: types.ts contract puts targetDate inside .payload
   const targetDate = action.payload?.targetDate ?? action.targetDate;
   if (!targetDate) {
     sendError(jobId, 'SIM_TO_DATE: missing targetDate in action.payload');
@@ -566,10 +662,10 @@ async function handleSimToDate(action: {
       daysAdvanced++;
 
       const reports = simulateMatchesOnDate(state.currentDate);
+      processEndOfDay(state.currentDate);
+      if (isFirstOfMonth(state.currentDate)) generateAIBids();
       updatePhase();
 
-      // During fast-forward only emit the player club's matches to avoid
-      // flooding the inbox with hundreds of unrelated reports.
       for (const report of reports) {
         const fix = state.fixtures[report.fixtureId];
         if (fix?.homeClubId === state.playerClubId || fix?.awayClubId === state.playerClubId) {
@@ -638,6 +734,125 @@ function handleSaveGame(action: {
   }
 }
 
+/**
+ * Manager buys a player from an AI club.
+ * Deducts fee from manager's transferBudget + balance.
+ * Adds fee to selling club's balance.
+ * Moves player to manager's squad and recalculates both wage bills.
+ */
+function handleMakeTransferOffer(action: {
+  type:    'MAKE_TRANSFER_OFFER';
+  jobId:   string;
+  payload: { playerId: string; fee: number; weeklyWage: number };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'MAKE_TRANSFER_OFFER')) return;
+
+  try {
+    const { playerId, fee, weeklyWage } = payload;
+    const player      = state.players[playerId];
+    const managerClub = state.clubs[state.playerClubId];
+
+    if (!player)      { sendError(jobId, 'Player not found'); return; }
+    if (!managerClub) { sendError(jobId, 'Manager club not found'); return; }
+    if (player.clubId === state.playerClubId) { sendError(jobId, 'Cannot buy your own player'); return; }
+    if (managerClub.finances.transferBudget < fee) { sendError(jobId, 'Insufficient transfer budget'); return; }
+
+    const sellingClubId = player.clubId;
+    const sellingClub   = state.clubs[sellingClubId];
+
+    // Deduct from manager's budget and balance
+    managerClub.finances.transferBudget -= fee;
+    managerClub.finances.balance        -= fee;
+
+    // Credit the selling club
+    if (sellingClub) sellingClub.finances.balance += fee;
+
+    // Move player and set new wage
+    (player as any).clubId     = state.playerClubId;
+    (player as any).weeklyWage = weeklyWage;
+
+    // Recalculate both clubs' wage bills
+    recalculateWageBill(state.playerClubId);
+    if (sellingClub) recalculateWageBill(sellingClubId);
+
+    state.lastUpdated = state.currentDate;
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] MAKE_TRANSFER_OFFER crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Manager accepts an AI bid for one of their players.
+ * Credits fee to manager's balance + transferBudget.
+ * Moves player to the buying club.
+ */
+function handleAcceptBid(action: {
+  type:    'ACCEPT_BID';
+  jobId:   string;
+  payload: { bidId: string };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'ACCEPT_BID')) return;
+
+  try {
+    const bid = (state.pendingBids ?? []).find(b => b.id === payload.bidId);
+    if (!bid) { sendError(jobId, 'Bid not found'); return; }
+
+    const player      = state.players[bid.playerId];
+    const buyClub     = state.clubs[bid.fromClubId];
+    const managerClub = state.clubs[state.playerClubId];
+
+    if (!player) { sendError(jobId, 'Player not found'); return; }
+
+    // Credit the manager
+    if (managerClub) {
+      managerClub.finances.balance        += bid.fee;
+      managerClub.finances.transferBudget += bid.fee;
+    }
+
+    // Deduct from buying club
+    if (buyClub) buyClub.finances.balance -= bid.fee;
+
+    // Move player
+    (player as any).clubId = bid.fromClubId;
+
+    // Remove this bid from the list
+    state.pendingBids = (state.pendingBids ?? []).filter(b => b.id !== bid.id);
+
+    // Recalculate wage bills for both clubs
+    recalculateWageBill(state.playerClubId);
+    if (buyClub) recalculateWageBill(buyClub.id);
+
+    state.lastUpdated = state.currentDate;
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] ACCEPT_BID crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Manager rejects a bid — just removes it from the pending list. */
+function handleRejectBid(action: {
+  type:    'REJECT_BID';
+  jobId:   string;
+  payload: { bidId: string };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'REJECT_BID')) return;
+
+  try {
+    state.pendingBids = (state.pendingBids ?? []).filter(b => b.id !== payload.bidId);
+    state.lastUpdated = state.currentDate;
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] REJECT_BID crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Message Router
 // ─────────────────────────────────────────────────────────────────────────────
@@ -647,12 +862,15 @@ self.onmessage = (event: MessageEvent) => {
   if (!action?.type) { console.warn('[worker] Received message with no type:', action); return; }
   console.log('[worker] Received action:', action.type, '| jobId:', action.jobId);
   switch (action.type) {
-    case 'INIT_LEAGUE':    handleInitLeague(action);    break;
-    case 'SIM_DAY':        handleSimDay(action);         break;
-    case 'SIM_TO_DATE':    handleSimToDate(action);      break;
-    case 'CANCEL_SIM':     handleCancelSim(action);      break;
-    case 'UPDATE_TACTICS': handleUpdateTactics(action);  break;
-    case 'SAVE_GAME':      handleSaveGame(action);       break;
+    case 'INIT_LEAGUE':          handleInitLeague(action);          break;
+    case 'SIM_DAY':              handleSimDay(action);              break;
+    case 'SIM_TO_DATE':          handleSimToDate(action);           break;
+    case 'CANCEL_SIM':           handleCancelSim(action);           break;
+    case 'UPDATE_TACTICS':       handleUpdateTactics(action);       break;
+    case 'SAVE_GAME':            handleSaveGame(action);            break;
+    case 'MAKE_TRANSFER_OFFER':  handleMakeTransferOffer(action);   break;
+    case 'ACCEPT_BID':           handleAcceptBid(action);           break;
+    case 'REJECT_BID':           handleRejectBid(action);           break;
     default:
       console.warn('[worker] Unknown action type:', action.type);
       if (action.jobId) sendError(action.jobId, `Unknown action type: ${action.type}`);

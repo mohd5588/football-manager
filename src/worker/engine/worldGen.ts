@@ -27,16 +27,12 @@ import {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 1 · Seeded Random Number Generator (Mulberry32 algorithm)
-//
-// Plain English: Math.random() gives a different number every time — we can't
-// reproduce the same world twice. A "seeded" RNG uses a starting number (the
-// seed) and always produces the same sequence of "random" numbers from it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Rng = () => number;
 
 function createRng(seed: number): Rng {
-  let s = seed >>> 0; // Ensure unsigned 32-bit integer
+  let s = seed >>> 0;
   return function (): number {
     s = (s + 0x6d2b79f5) >>> 0;
     let t = Math.imul(s ^ (s >>> 15), 1 | s);
@@ -45,12 +41,10 @@ function createRng(seed: number): Rng {
   };
 }
 
-/** Pick a random item from an array using the seeded RNG */
 function pick<T>(arr: readonly T[], rng: Rng): T {
   return arr[Math.floor(rng() * arr.length)];
 }
 
-/** Generate a random integer between min and max (inclusive) */
 function randInt(min: number, max: number, rng: Rng): number {
   return min + Math.floor(rng() * (max - min + 1));
 }
@@ -77,7 +71,6 @@ const NICKNAMES: readonly string[] = [
   'Vale', 'Orient', 'Stanley', 'Alexandra',
 ];
 
-// Short 3-letter codes for the standings table — derived from club name
 function toShortName(name: string): string {
   const words = name.split(' ');
   if (words.length === 1) return name.slice(0, 3).toUpperCase();
@@ -109,30 +102,15 @@ const LAST_NAMES: readonly string[] = [
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 4 · Attribute Generation
-//
-// Plain English: We use a "bell curve" (Gaussian distribution) so most players
-// are average for their tier, with a few stars and a few poor ones.
-// EPL mean = 80, League Two mean = 55, so EPL players are noticeably better.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Box-Muller transform — converts uniform random numbers into a bell curve.
- * Returns a value clamped to [1, 99].
- */
 function gaussianRandom(rng: Rng, mean: number, stdDev: number): number {
-  // Need two random numbers for the formula
-  const u1 = Math.max(1e-10, rng()); // Avoid log(0)
+  const u1 = Math.max(1e-10, rng());
   const u2 = rng();
   const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
   return Math.round(Math.max(1, Math.min(99, mean + z * stdDev)));
 }
 
-/**
- * Generate all 8 attributes for a player.
- * Attributes are biased toward the player's role:
- *   - A striker gets boosted Pace and Finishing, reduced Goalkeeping
- *   - A goalkeeper gets boosted Goalkeeping, reduced Finishing, etc.
- */
 function generateAttributes(rng: Rng, mean: number, position: Position): PlayerAttributes {
   const base = (boost = 0) => gaussianRandom(rng, mean + boost, 8);
 
@@ -149,17 +127,14 @@ function generateAttributes(rng: Rng, mean: number, position: Position): PlayerA
     defending:    isDef ? base(10) : isFwd ? base(-10) : isMid ? base(-2) : base(-20),
     physical:     isDef ? base(6)  : base(),
     goalkeeping:  isGK  ? base(15) : base(-25),
-    intelligence: base(), // No positional bias — equally important everywhere
+    intelligence: base(),
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 5 · Squad Template & Player Generation
-//
-// Each club gets 20 players: 11 starters + 9 squad members.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Positional breakdown for a typical 4-3-3 squad
 const SQUAD_POSITIONS: readonly Position[] = [
   // Starting XI (indices 0–10)
   'GK',
@@ -167,11 +142,11 @@ const SQUAD_POSITIONS: readonly Position[] = [
   'CDM', 'CM', 'CM',
   'LW', 'RW', 'ST',
   // Squad / Bench (indices 11–19)
-  'GK',          // Backup keeper
-  'CB', 'LB',    // Defensive cover
-  'CM', 'CAM',   // Midfield cover
-  'LW', 'ST',    // Attacking cover
-  'CDM', 'RB',   // Extra cover
+  'GK',
+  'CB', 'LB',
+  'CM', 'CAM',
+  'LW', 'ST',
+  'CDM', 'RB',
 ];
 
 function generatePlayer(
@@ -183,13 +158,14 @@ function generatePlayer(
   const age        = randInt(17, 34, rng);
   const attributes = generateAttributes(rng, tierMean, position);
 
-  // Current ability = simple average of all 8 attributes
   const allValues      = Object.values(attributes);
   const currentAbility = Math.round(allValues.reduce((a, b) => a + b, 0) / allValues.length);
 
-  // Young players have more potential headroom
   const potentialBonus = age < 23 ? randInt(5, 25, rng) : randInt(0, 8, rng);
   const potential      = Math.min(99, currentAbility + potentialBonus);
+
+  // Weekly wage: ability * £200/week. An EPL star (80 OVR) earns ~£16k/wk.
+  const weeklyWage = currentAbility * 200;
 
   return {
     id:              crypto.randomUUID(),
@@ -202,6 +178,7 @@ function generatePlayer(
     potential,
     status:          'active',
     unavailableWeeks: 0,
+    weeklyWage,
     seasonStats: {
       appearances:   0,
       goals:         0,
@@ -225,7 +202,6 @@ interface TierFinanceBase {
   stadiumRevenue: number;
 }
 
-// Approximate real-world proportions, scaled down for gameplay feel
 const FINANCE_BASES: Record<Tier, TierFinanceBase> = {
   [Tier.EPL]:          { balance: 50_000_000, wageBill: 2_000_000, transferBudget: 20_000_000, stadiumRevenue: 3_000_000 },
   [Tier.Championship]: { balance: 10_000_000, wageBill:   400_000, transferBudget:  3_000_000, stadiumRevenue:   500_000 },
@@ -234,10 +210,8 @@ const FINANCE_BASES: Record<Tier, TierFinanceBase> = {
 };
 
 function generateFinances(tier: Tier, rng: Rng) {
-  const base = FINANCE_BASES[tier];
-  // Multiply each base by a random factor between 0.5x and 1.5x
-  // This creates realistic variation: some clubs are richer than others in the same tier
-  const vary = (v: number) => Math.round(v * (0.5 + rng()));
+  const base  = FINANCE_BASES[tier];
+  const vary  = (v: number) => Math.round(v * (0.5 + rng()));
   return {
     balance:        vary(base.balance),
     wageBill:       vary(base.wageBill),
@@ -260,7 +234,6 @@ function generateClub(
   tier:      Tier,
   usedNames: Set<string>,
 ): ClubGenResult {
-  // Pick a city + nickname — retry if the name is already taken
   const regionKey = pick(Object.keys(CITIES_BY_REGION), rng);
   const city      = pick(CITIES_BY_REGION[regionKey], rng);
 
@@ -272,23 +245,18 @@ function generateClub(
   }
   usedNames.add(name);
 
-  const clubId:    EntityId = crypto.randomUUID();
-  const tierMean:  number   = TIER_CONFIG[tier].meanAttributeScore;
+  const clubId:   EntityId = crypto.randomUUID();
+  const tierMean: number   = TIER_CONFIG[tier].meanAttributeScore;
 
-  // Generate players and record their IDs for the tactics lineup
-  const players:     Player[]    = [];
-  const startingXI:  EntityId[]  = [];
-  const bench:       EntityId[]  = [];
+  const players:    Player[]   = [];
+  const startingXI: EntityId[] = [];
+  const bench:      EntityId[] = [];
 
   SQUAD_POSITIONS.forEach((position, index) => {
     const player = generatePlayer(rng, clubId, position, tierMean);
     players.push(player);
-
-    if (index < 11) {
-      startingXI.push(player.id); // First 11 = the starting lineup
-    } else {
-      bench.push(player.id);      // Remaining = bench
-    }
+    if (index < 11) startingXI.push(player.id);
+    else            bench.push(player.id);
   });
 
   const club: Club = {
@@ -305,7 +273,7 @@ function generateClub(
       mentality:      'balanced' as Mentality,
       pressIntensity: 'medium',
       startingXI,
-      bench: bench.slice(0, 5), // Bench can only hold 5
+      bench: bench.slice(0, 5),
     },
     finances: generateFinances(tier, rng),
   };
@@ -315,9 +283,6 @@ function generateClub(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 8 · Main Export — generateWorld()
-//
-// This is the only function the rest of the app calls.
-// Returns all 92 clubs and all ~1,840 players as lookup dictionaries.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface WorldGenResult {
@@ -325,7 +290,6 @@ export interface WorldGenResult {
   players: Record<EntityId, Player>;
 }
 
-// How many clubs to generate per tier — must match the pyramid rules
 const TIER_CLUB_COUNTS: [Tier, number][] = [
   [Tier.EPL,          20],
   [Tier.Championship, 24],
@@ -343,7 +307,6 @@ export function generateWorld(config: WorldGenConfig): WorldGenResult {
   for (const [tier, count] of TIER_CLUB_COUNTS) {
     for (let i = 0; i < count; i++) {
       const { club, players: squad } = generateClub(rng, tier, usedNames);
-
       clubs[club.id] = club;
       for (const player of squad) {
         players[player.id] = player;

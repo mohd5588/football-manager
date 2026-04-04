@@ -1,51 +1,29 @@
 /**
  * src/services/SimulationService.ts
  *
- * The authoritative implementation of ISimulationService.
+ * The sole bridge between UI components and the Web Worker.
+ * Components call methods on this service — they never touch postMessage.
  *
- * This is the ONLY module that:
- *   - Calls workerBridge.send()
- *   - Writes save data to IndexedDB via Dexie helpers
- *   - Updates the Zustand gameStore after each worker response
- *   - Routes MATCH_RESULT responses to the inboxStore
- *
- * All React components call methods on this service. They never touch the
- * bridge, the worker, or the database directly.
- *
- * NOTE ON FIELD NAMING
- * --------------------
- * types.ts defines SyncStateResponse with a `.payload` field.
- * The actual worker (sim.worker.ts) sends the game data in `.state`.
- * Wherever we read a SYNC_STATE response we use:
- *   (response as any).state ?? (response as any).payload
- * so this service works with the real worker output today, and will
- * continue to work if the worker is updated to match types.ts later.
- *
- * BUG FIX (Phase 4):
- * ------------------
- * The constructor previously called workerBridge.onSyncState() TWICE —
- * once for SYNC_STATE handling and once for MATCH_RESULT handling.
- *
- * If onSyncState() is a setter (last-writer-wins semantics, which is the
- * common pattern for a single-listener bridge), the second call silently
- * replaced the first. Result: the SYNC_STATE → applyGameState path was
- * dead, so Zustand never updated after simulating a day and the simulate
- * button appeared to do nothing.
- *
- * Fix: a single onSyncState() registration that dispatches to both
- * handlers. MATCH_RESULT reports now correctly reach the inboxStore.
+ * Phase 6 additions:
+ *   ✅ makeTransferOffer  — manager buys a player from an AI club
+ *   ✅ acceptBid          — manager sells a player to an AI club
+ *   ✅ rejectBid          — manager declines a bid, clears it from state
+ *   ✅ Bid detection      — after every SYNC_STATE, check for new incoming
+ *                          bids and push an AttentionEvent so simulation pauses
  */
 
-import type {
-  ISimulationService,
-  ClientGameState,
-  SerializedGameState,
-  WorkerResponse,
-  SaveSlotMeta,
-  WorldGenConfig,
+import workerBridge from './workerBridge';
+import {
+  type SerializedGameState,
+  type ClientGameState,
+  type WorkerResponse,
+  type SaveSlotMeta,
+  type WorldGenConfig,
+  isSyncStateResponse,
+  isMatchResultResponse,
+  isSaveExportResponse,
+  isProgressReportResponse,
 } from '../types';
-import { isSyncStateResponse, isSaveExportResponse, isMatchResultResponse } from '../types';
-import { workerBridge } from './workerBridge';
 import {
   writeSaveSlot,
   readSaveSlot,
@@ -54,18 +32,16 @@ import {
 } from '../db/database';
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Safely extract the SerializedGameState from a SYNC_STATE response.
- *
- * The worker sends it as `response.state`.
+ * The worker sends state as `response.state`.
  * types.ts declares it as `response.payload`.
  * This function handles both so nothing breaks either way.
  */
 function extractState(response: WorkerResponse): SerializedGameState | null {
-  const r = response as Record<string, unknown>;
+  const r   = response as Record<string, unknown>;
   const raw = (r.state ?? r.payload) as SerializedGameState | undefined;
   return raw ?? null;
 }
@@ -73,23 +49,13 @@ function extractState(response: WorkerResponse): SerializedGameState | null {
 /**
  * Convert the raw SerializedGameState (arrives from the worker) into
  * the ClientGameState shape that Zustand and the UI components use.
- *
- * This derives three convenience fields the dashboard reads directly:
- *
- *   playerClub         — the Club object the manager is in charge of
- *   nextFixture        — the next unplayed game for that club
- *   playerStandingsRow — that club's current row in the league table
  */
 function toClientState(raw: SerializedGameState): ClientGameState {
-  // ── 1. Find the player's club ─────────────────────────────────────────
-  // clubs is an object keyed by ID: { "club_0": { id: "club_0", ... } }
-  // If playerClubId is not set, fall back to the first club in the object.
   const playerClub =
     raw.clubs[raw.playerClubId] ??
     Object.values(raw.clubs)[0] ??
     null;
 
-  // ── 2. Find the next unplayed fixture for the player's club ───────────
   const nextFixture = playerClub
     ? Object.values(raw.fixtures)
         .filter(
@@ -100,7 +66,6 @@ function toClientState(raw: SerializedGameState): ClientGameState {
         .sort((a, b) => (a.date < b.date ? -1 : 1))[0] ?? null
     : null;
 
-  // ── 3. Find the player's row in the standings table ───────────────────
   const playerStandingsRow = playerClub
     ? (raw.standings[playerClub.currentTier] ?? []).find(
         (row) => row.clubId === playerClub.id
@@ -109,9 +74,10 @@ function toClientState(raw: SerializedGameState): ClientGameState {
 
   return {
     ...raw,
+    pendingBids:        raw.pendingBids ?? [],
     playerClub:         playerClub!,
-    nextFixture:        nextFixture,
-    playerStandingsRow: playerStandingsRow,
+    nextFixture,
+    playerStandingsRow,
     isSimulating:       false,
     simulationProgress: 0,
   };
@@ -121,43 +87,37 @@ function toClientState(raw: SerializedGameState): ClientGameState {
 // SimulationService class
 // ---------------------------------------------------------------------------
 
-class SimulationService implements ISimulationService {
-  // Tracks the jobId of any running SIM_TO_DATE so we can cancel it
+class SimulationService {
   private currentJobId: string | null = null;
+
+  /**
+   * Tracks bid IDs we've already raised as AttentionEvents.
+   * Prevents the same bid triggering the inbox banner on every SYNC_STATE.
+   * Reset when a new game is started or loaded.
+   */
+  private processedBidIds = new Set<string>();
 
   constructor() {
     // ── Single unified worker-message handler ──────────────────────────
     //
-    // IMPORTANT: only register onSyncState ONCE.
-    //
-    // If it is a setter (last-writer-wins), two registrations would silently
-    // drop the first. The previous code registered it twice — once for
-    // SYNC_STATE and once for MATCH_RESULT — which killed the SYNC_STATE →
-    // Zustand update path and broke the simulate button entirely.
-    //
-    // Every response type is handled inside this single callback so we never
-    // risk that silent-replacement bug again.
+    // IMPORTANT: register onSyncState ONCE only. Two registrations silently
+    // replace each other and break the Zustand update path.
     workerBridge.onSyncState((response: WorkerResponse) => {
 
       // ── SYNC_STATE: push new world state into Zustand ──────────────
       if (isSyncStateResponse(response)) {
         const raw = extractState(response);
-        if (raw) this.applyGameState(raw);
+        if (raw) {
+          this.checkForNewBids(raw);
+          this.applyGameState(raw);
+        }
       }
 
-      // ── MATCH_RESULT: route report to the inbox ────────────────────
-      //
-      // The worker sends MATCH_RESULT alongside SYNC_STATE after every
-      // simulated game. We extract the MatchReport and push it to the
-      // inboxStore so it appears as a Tactical Insight ticket in the Inbox.
-      //
-      // Field-name normalisation: types.ts uses `.payload`; the current
-      // worker emits `.report`. Accept either.
+      // ── MATCH_RESULT: route report to the inbox ─────────────────────
       if (isMatchResultResponse(response)) {
         const r      = response as Record<string, unknown>;
         const report = (r.payload ?? r.report) as Record<string, unknown> | undefined;
         if (report) {
-          // Dynamic import keeps SimulationService free of a hard circular dep.
           import('../store/inboxStore').then(({ useInboxStore }) => {
             useInboxStore.getState().pushReport(report as any);
           });
@@ -168,11 +128,50 @@ class SimulationService implements ISimulationService {
     console.log('[SimulationService] Ready ✅');
   }
 
+  // ─── Bid detection ──────────────────────────────────────────────────────
+
+  /**
+   * After every SYNC_STATE, scan pendingBids for new entries that target
+   * one of the manager's players. For each new bid, push an AttentionEvent
+   * so the simulation pauses and the manager is prompted to review the offer.
+   */
+  private checkForNewBids(state: SerializedGameState): void {
+    const pendingBids = state.pendingBids ?? [];
+    for (const bid of pendingBids) {
+      // Skip bids we've already shown
+      if (this.processedBidIds.has(bid.id)) continue;
+
+      // Only react to bids targeting the manager's squad
+      const player = state.players[bid.playerId];
+      if (!player || player.clubId !== state.playerClubId) continue;
+
+      this.processedBidIds.add(bid.id);
+
+      const fromClub = state.clubs[bid.fromClubId];
+      const fee = bid.fee >= 1_000_000
+        ? `£${(bid.fee / 1_000_000).toFixed(1)}m`
+        : `£${Math.round(bid.fee / 1_000)}k`;
+
+      import('../store/inboxStore').then(({ useInboxStore }) => {
+        useInboxStore.getState().pushAttention({
+          id:              bid.id,
+          type:            'transfer_offer',
+          title:           'Transfer Bid Received',
+          body:            `${fromClub?.name ?? 'A club'} have offered ${fee} for ${player.name}.`,
+          primaryAction:   'Review offer',
+          secondaryAction: 'Reject & continue',
+          primaryTab:      'transfers',
+        });
+      });
+    }
+  }
+
   // ─── League initialisation ─────────────────────────────────────────────
 
   async initLeague(config: WorldGenConfig): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
+    this.processedBidIds.clear(); // fresh game = fresh bid history
 
     try {
       const response = await workerBridge.send({
@@ -196,9 +195,6 @@ class SimulationService implements ISimulationService {
     useGameStore.getState().setSimulating(true);
 
     try {
-      // workerBridge.send() resolves when the terminal SYNC_STATE arrives.
-      // Any MATCH_RESULT messages emitted before that are handled by the
-      // unified onSyncState listener above (inbox routing).
       await workerBridge.send({ type: 'SIM_DAY', payload: {} });
     } finally {
       useGameStore.getState().setSimulating(false);
@@ -225,7 +221,7 @@ class SimulationService implements ISimulationService {
         },
         (progressResponse) => {
           if (progressResponse.type === 'PROGRESS_REPORT') {
-            const r = progressResponse as Record<string, unknown>;
+            const r   = progressResponse as Record<string, unknown>;
             const pct =
               ((r.payload as Record<string, unknown>)?.percent as number) ??
               (r.percentComplete as number) ??
@@ -248,13 +244,10 @@ class SimulationService implements ISimulationService {
     workerBridge.send({
       type:    'CANCEL_SIM',
       payload: { targetJobId: this.currentJobId ?? '' },
-    }).catch(() => {
-      // CANCEL_SIM may not always send a terminal response — safe to swallow.
-    });
+    }).catch(() => {});
     this.currentJobId = null;
   }
 
-  // Called by the Stop button in SimulateControl
   cancelCurrentSim(): void {
     this.cancelSim();
   }
@@ -287,10 +280,10 @@ class SimulationService implements ISimulationService {
       throw new Error('Worker did not return a SAVE_EXPORT response');
     }
 
-    // Handle both .payload.snapshot and .snapshot field names
-    const r = response as Record<string, unknown>;
+    const r        = response as Record<string, unknown>;
     const snapshot =
-      ((r.payload as Record<string, unknown>)?.snapshot ?? r.snapshot) as SerializedGameState;
+      ((r.payload as Record<string, unknown>)?.snapshot ??
+       r.snapshot) as SerializedGameState;
 
     await writeSaveSlot(slotIndex, slotName, snapshot);
     console.log(`[SimulationService] Game saved to slot ${slotIndex} ("${slotName}")`);
@@ -299,6 +292,7 @@ class SimulationService implements ISimulationService {
   async loadGame(slotIndex: number): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
+    this.processedBidIds.clear(); // loaded save = fresh bid detection history
 
     try {
       const record = await readSaveSlot(slotIndex);
@@ -356,6 +350,94 @@ class SimulationService implements ISimulationService {
       await writeSaveSlot(slot.slotIndex, slot.saveName, (slot as any).state);
     }
     console.log(`[SimulationService] Imported ${payload.saves.length} save slot(s)`);
+  }
+
+  // ─── Transfer Market ────────────────────────────────────────────────────
+
+  /**
+   * Manager buys a player from an AI club.
+   * The worker handles: deducting the fee, moving the player, recalculating wages.
+   */
+  async makeTransferOffer(playerId: string, fee: number, weeklyWage: number): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+
+    try {
+      await workerBridge.send({
+        type:    'MAKE_TRANSFER_OFFER',
+        payload: { playerId, fee, weeklyWage },
+      });
+
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast('Transfer completed!', 'success');
+      });
+    } catch (err) {
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          err instanceof Error ? err.message : 'Transfer failed.',
+          'error'
+        );
+      });
+      throw err;
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  /**
+   * Manager accepts an AI club's bid for one of their players.
+   * The worker handles: crediting the fee, moving the player, recalculating wages.
+   * The bid is also removed from processedBidIds so it won't re-trigger.
+   */
+  async acceptBid(bidId: string): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+    this.processedBidIds.delete(bidId); // allow the bid to be cleaned up cleanly
+
+    try {
+      await workerBridge.send({
+        type:    'ACCEPT_BID',
+        payload: { bidId },
+      });
+
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast('Player sold!', 'success');
+      });
+    } catch (err) {
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          err instanceof Error ? err.message : 'Could not complete sale.',
+          'error'
+        );
+      });
+      throw err;
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  /**
+   * Manager rejects an AI bid — removes it from state and dismisses
+   * any attention event associated with it.
+   */
+  async rejectBid(bidId: string): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+    this.processedBidIds.delete(bidId);
+
+    try {
+      await workerBridge.send({
+        type:    'REJECT_BID',
+        payload: { bidId },
+      });
+
+      // Also clear the attention event if it's still in the queue
+      import('../store/inboxStore').then(({ useInboxStore }) => {
+        useInboxStore.getState().resolveAttention(bidId);
+      });
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
   }
 
   // ─── Internal ──────────────────────────────────────────────────────────

@@ -4,9 +4,10 @@ import { useInboxStore } from '../../store/inboxStore'
 import SimulateControl from '../dashboard/SimulateControl'
 
 const NAV_ITEMS = [
-  { id: 'dashboard' as const, label: 'Dashboard', icon: '⚽' },
-  { id: 'squad'     as const, label: 'Squad',     icon: '👥' },
-  { id: 'scouting'  as const, label: 'Scouting',  icon: '🔭' },
+  { id: 'dashboard'  as const, label: 'Dashboard',  icon: '⚽' },
+  { id: 'squad'      as const, label: 'Squad',      icon: '👥' },
+  { id: 'transfers'  as const, label: 'Transfers',  icon: '💸' },
+  { id: 'scouting'   as const, label: 'Scouting',   icon: '🔭' },
 ] as const
 
 const TIER_LABELS = ['EPL', 'Championship', 'League One', 'League Two']

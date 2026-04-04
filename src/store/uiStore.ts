@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type NavTab = 'dashboard' | 'squad' | 'scouting'
+export type NavTab = 'dashboard' | 'squad' | 'scouting' | 'transfers'
 export type ModalId = 'newGame' | 'saveGame' | 'loadGame' | 'exportJson' | 'importJson' | 'simSettings'
 export type SimMode = 'to_fixture' | 'one_day' | 'matchweek'
 

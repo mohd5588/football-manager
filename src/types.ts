@@ -136,10 +136,6 @@ export interface PlayerAttributes {
 /**
  * Derived at runtime inside the Worker from `PlayerAttributes.intelligence`.
  * Never persisted; never sent across the wire raw — computed on demand.
- *
- * Formula (example):
- *   findSpaceModifier      = 0.5 + (intelligence / 100) * 1.0   → [0.5, 1.5]
- *   interceptionModifier   = 0.5 + (intelligence / 100) * 1.0   → [0.5, 1.5]
  */
 export interface IntelligenceProfile {
   /** Multiplier applied to in-box pass-reception probability. */
@@ -159,9 +155,11 @@ export type PlayerStatus = "active" | "injured" | "suspended" | "regen";
 
 export interface Player {
   readonly id:          EntityId;
-  readonly clubId:      EntityId;
+  /** Mutable — changes on transfer. */
+  clubId:               EntityId;
   readonly name:        string;
-  readonly age:         number;
+  /** Mutable — increments each season during off_season. */
+  age:                  number;
   readonly position:    Position;
   readonly attributes:  PlayerAttributes;
   /** Current ability — may diverge from potential mid-season. */
@@ -170,6 +168,8 @@ export interface Player {
   readonly status:         PlayerStatus;
   /** Weeks remaining if injured/suspended; 0 otherwise. */
   readonly unavailableWeeks: number;
+  /** Weekly wage in GBP. */
+  weeklyWage:           number;
   /** Season stats accumulated so far. */
   readonly seasonStats: PlayerSeasonStats;
 }
@@ -208,7 +208,7 @@ export interface Tactics {
 
 export interface ClubFinances {
   balance:        number;  // GBP
-  wageBill:       number;  // per week GBP
+  wageBill:       number;  // per week GBP (sum of all player weeklyWage)
   transferBudget: number;  // GBP
   stadiumRevenue: number;  // per match day GBP
 }
@@ -288,14 +288,10 @@ export interface PlayoffTie {
   readonly round:         PlayoffRound;
   readonly homeClubId:    EntityId;
   readonly awayClubId:    EntityId;
-  /** Populated after leg 1 is played. */
   firstLegResult?:        MatchResult;
-  /** Populated after leg 2 is played (or final). */
   secondLegResult?:       MatchResult;
-  /** Computed aggregate after both legs. */
   aggregateHome?:         number;
   aggregateAway?:         number;
-  /** Set if tie is decided by penalties. */
   penaltyWinnerId?:       EntityId;
   winnerId?:              EntityId;
 }
@@ -305,6 +301,28 @@ export interface PlayoffBracket {
   readonly season: number;
   ties:            PlayoffTie[];
   winnerId?:       EntityId;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 5b · TRANSFER MARKET
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A bid made by an AI club for one of the player-manager's players.
+ * Lives in SerializedGameState.pendingBids — persists across saves.
+ */
+export interface TransferBid {
+  readonly id:          EntityId;
+  /** The player being targeted (always in the manager's squad). */
+  readonly playerId:    EntityId;
+  /** The AI club making the bid. */
+  readonly fromClubId:  EntityId;
+  /** Offered transfer fee in GBP. */
+  readonly fee:         number;
+  /** Proposed weekly wage in GBP the buying club will pay. */
+  readonly weeklyWage:  number;
+  /** Date the bid was generated (ISO). */
+  readonly createdDate: ISODateString;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +359,8 @@ export interface SerializedGameState {
   playerClubId:        EntityId;
   /** Clubs that dropped to Non-League (inactive) this season. */
   nonLeagueClubIds:    EntityId[];
+  /** Pending AI bids for the manager's players. */
+  pendingBids:         TransferBid[];
   lastUpdated:         ISODateString;
 }
 
@@ -367,62 +387,39 @@ export interface ClientGameState extends SerializedGameState {
 // § 7 · WORKER ACTION CONTRACT (Main Thread → Worker)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Every action carries a unique `jobId`.
- * The Worker echoes it back in the corresponding response so the
- * Service Layer can correlate async replies (e.g. progress bars).
- */
 interface BaseAction {
   readonly jobId: EntityId;
 }
 
-/** Bootstrap the engine with a freshly-generated or loaded world. */
 export interface InitLeagueAction extends BaseAction {
   readonly type:    "INIT_LEAGUE";
   readonly payload: {
-    /** Which tier the human player manages. */
     playerTier:    Tier;
-    /** Name chosen by the player for the save slot. */
     saveName:      string;
-    /** Optional seed for reproducible world generation. */
     seed?:         number;
   };
 }
 
-/** Advance the simulation by exactly one calendar day. */
 export interface SimDayAction extends BaseAction {
   readonly type:    "SIM_DAY";
-  readonly payload: Record<string, never>; // intentionally empty
+  readonly payload: Record<string, never>;
 }
 
-/**
- * Fast-forward to a target date.
- * The Worker sends PROGRESS_REPORT messages during this operation.
- * A subsequent CANCEL_SIM will abort it cleanly.
- */
 export interface SimToDateAction extends BaseAction {
   readonly type:    "SIM_TO_DATE";
   readonly payload: {
     targetDate:  ISODateString;
-    /**
-     * Safety cap: Worker will halt and report SYNC_STATE if
-     * this many days would be simulated. Prevents runaway loops.
-     * @default 365
-     */
     maxDays?:    number;
   };
 }
 
-/** Abort an in-progress SIM_TO_DATE job. Worker finalises the current day. */
 export interface CancelSimAction extends BaseAction {
   readonly type:    "CANCEL_SIM";
   readonly payload: {
-    /** jobId of the SIM_TO_DATE to cancel. */
     targetJobId: EntityId;
   };
 }
 
-/** Replace a club's active tactics. */
 export interface UpdateTacticsAction extends BaseAction {
   readonly type:    "UPDATE_TACTICS";
   readonly payload: {
@@ -431,12 +428,37 @@ export interface UpdateTacticsAction extends BaseAction {
   };
 }
 
-/** Persist the current state to IndexedDB and return a SAVE_EXPORT. */
 export interface SaveGameAction extends BaseAction {
   readonly type:    "SAVE_GAME";
   readonly payload: {
-    slotIndex:  0 | 1 | 2 | 3 | 4; // up to 5 named save slots
-    saveName?:  string;             // rename the slot if provided
+    slotIndex:  0 | 1 | 2 | 3 | 4;
+    saveName?:  string;
+  };
+}
+
+/** Manager buys a player from an AI club. */
+export interface MakeTransferOfferAction extends BaseAction {
+  readonly type:    "MAKE_TRANSFER_OFFER";
+  readonly payload: {
+    playerId:   EntityId;
+    fee:        number;
+    weeklyWage: number;
+  };
+}
+
+/** Manager accepts an AI club's bid for one of their players. */
+export interface AcceptBidAction extends BaseAction {
+  readonly type:    "ACCEPT_BID";
+  readonly payload: {
+    bidId: EntityId;
+  };
+}
+
+/** Manager rejects an AI club's bid. */
+export interface RejectBidAction extends BaseAction {
+  readonly type:    "REJECT_BID";
+  readonly payload: {
+    bidId: EntityId;
   };
 }
 
@@ -446,36 +468,29 @@ export type WorkerAction =
   | SimToDateAction
   | CancelSimAction
   | UpdateTacticsAction
-  | SaveGameAction;
+  | SaveGameAction
+  | MakeTransferOfferAction
+  | AcceptBidAction
+  | RejectBidAction;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 8 · WORKER RESPONSE CONTRACT (Worker → Main Thread)
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface BaseResponse {
-  /** Echoed from the originating WorkerAction. */
   readonly jobId: EntityId;
 }
 
-/**
- * Full state synchronisation.
- * Sent after every day simulation, tactic update, and save.
- */
 export interface SyncStateResponse extends BaseResponse {
   readonly type:    "SYNC_STATE";
   readonly payload: SerializedGameState;
 }
 
-/**
- * Detailed stats for a single completed match.
- * Sent alongside SYNC_STATE so the UI can render a match report modal.
- */
 export interface MatchResultResponse extends BaseResponse {
   readonly type:    "MATCH_RESULT";
   readonly payload: MatchReport;
 }
 
-/** Streaming progress update during SIM_TO_DATE. */
 export interface ProgressReportResponse extends BaseResponse {
   readonly type:    "PROGRESS_REPORT";
   readonly payload: {
@@ -485,28 +500,21 @@ export interface ProgressReportResponse extends BaseResponse {
   };
 }
 
-/**
- * Full JSON snapshot ready for download / import.
- * Sent after SAVE_GAME completes.
- */
 export interface SaveExportResponse extends BaseResponse {
   readonly type:    "SAVE_EXPORT";
   readonly payload: {
     slotIndex:    0 | 1 | 2 | 3 | 4;
     snapshot:     SerializedGameState;
     exportedAt:   ISODateString;
-    /** Byte-size of the JSON string — useful for UI storage warnings. */
     sizeBytes:    number;
   };
 }
 
-/** Structured error response — always include in UI error boundaries. */
 export interface WorkerErrorResponse extends BaseResponse {
   readonly type:    "WORKER_ERROR";
   readonly payload: {
     code:     WorkerErrorCode;
     message:  string;
-    /** Original action type that triggered the error. */
     source:   WorkerAction["type"];
   };
 }
@@ -537,7 +545,6 @@ export interface MatchEvent {
   readonly type:      "goal" | "assist" | "yellow_card" | "red_card" | "substitution" | "penalty_saved";
   readonly playerId:  EntityId;
   readonly clubId:    EntityId;
-  /** Optional secondary actor (e.g. assister on a goal). */
   readonly relatedPlayerId?: EntityId;
 }
 
@@ -547,16 +554,16 @@ export interface ClubMatchStats {
   readonly xG:          number;
   readonly shots:       number;
   readonly shotsOnTarget: number;
-  readonly possession:  number; // 0–100
+  readonly possession:  number;
   readonly passes:      number;
-  readonly passAccuracy: number; // 0–100
+  readonly passAccuracy: number;
   readonly tackles:     number;
   readonly interceptions: number;
 }
 
 export interface PlayerMatchRating {
   readonly playerId:    EntityId;
-  readonly rating:      number; // 0–10, two decimal places
+  readonly rating:      number;
   readonly goals:       number;
   readonly assists:     number;
   readonly keyPasses:   number;
@@ -570,16 +577,12 @@ export interface MatchReport {
   readonly awayStats:     ClubMatchStats;
   readonly events:        readonly MatchEvent[];
   readonly playerRatings: readonly PlayerMatchRating[];
-  readonly motmPlayerId:  EntityId; // Man of the Match
-  /**
-   * Narrative summary lines for the Inbox event centre.
-   * Pre-generated by the Worker so the UI never re-derives match text.
-   */
+  readonly motmPlayerId:  EntityId;
   readonly narrativeSummary: readonly string[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// § 10 · SAVE / LOAD SLOT MANAGEMENT (IndexedDB schema helpers)
+// § 10 · SAVE / LOAD SLOT MANAGEMENT
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SaveSlotMeta {
@@ -591,26 +594,17 @@ export interface SaveSlotMeta {
   readonly tier:        Tier;
   readonly savedAt:     ISODateString;
   readonly version:     string;
-  /** Approximate save size in bytes for UI warnings. */
   readonly sizeBytes:   number;
 }
 
-/** Full slot record stored in Dexie's `saves` table. */
 export interface SaveSlotRecord extends SaveSlotMeta {
-  /** The serialised world — never load into memory until user confirms. */
   readonly snapshot: SerializedGameState;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// § 11 · SERVICE LAYER INTERFACE (Main Thread mediator)
+// § 11 · SERVICE LAYER INTERFACE
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * The sole public API surface for UI components.
- * Implemented by `SimulationService` — wraps all postMessage calls.
- *
- * Components import this interface, never the Worker directly.
- */
 export interface ISimulationService {
   initLeague(payload: InitLeagueAction["payload"]): Promise<SyncStateResponse>;
   simDay():                                         Promise<SyncStateResponse>;
@@ -619,20 +613,15 @@ export interface ISimulationService {
   cancelSim(targetJobId: EntityId):                 Promise<void>;
   updateTactics(payload: UpdateTacticsAction["payload"]): Promise<SyncStateResponse>;
   saveGame(payload: SaveGameAction["payload"]):     Promise<SaveExportResponse>;
-  /** Load a slot — returns state WITHOUT committing it (preview). */
   previewSaveSlot(slotIndex: SaveSlotMeta["slotIndex"]): Promise<SaveSlotMeta>;
-  /** Load a slot and hydrate the Worker. Returns full state sync. */
   loadSaveSlot(slotIndex: SaveSlotMeta["slotIndex"]):    Promise<SyncStateResponse>;
-  /** Export entire DB as a portable JSON string. */
   exportSnapshot():                                 Promise<string>;
-  /** Import a JSON string, validate schema version, write to slot. */
   importSnapshot(json: string, slotIndex: SaveSlotMeta["slotIndex"]): Promise<SaveSlotMeta>;
-  /** List all occupied save slots. */
   listSaveSlots():                                  Promise<SaveSlotMeta[]>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// § 12 · TYPE GUARDS (runtime narrowing for postMessage handlers)
+// § 12 · TYPE GUARDS
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function isWorkerResponse(v: unknown): v is WorkerResponse {
@@ -667,13 +656,9 @@ export function isWorkerErrorResponse(r: WorkerResponse): r is WorkerErrorRespon
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// § 13 · WORLD GENERATION CONFIG (fed into INIT_LEAGUE)
+// § 13 · WORLD GENERATION CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Geography buckets used by the world-generator to produce
- * plausible city/nickname combos (e.g. "Northern Reds", "Westport City").
- */
 export type GeographyRegion =
   | "north_west" | "north_east" | "yorkshire"
   | "midlands"   | "east"       | "london"
@@ -681,8 +666,7 @@ export type GeographyRegion =
 
 export interface WorldGenConfig {
   readonly seed:       number;
-  readonly season:     number; // Starting season year
+  readonly season:     number;
   readonly regions:    readonly GeographyRegion[];
-  /** Override per-tier mean if tuning difficulty. */
   readonly tierMeanOverrides?: Partial<Record<Tier, AttributeScore>>;
 }

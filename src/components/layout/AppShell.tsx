@@ -5,6 +5,7 @@ import InboxDrawer from './InboxDrawer'
 import Dashboard from '../dashboard/Dashboard'
 import SquadView from '../squad/SquadView'
 import ScoutingView from '../scouting/ScoutingView'
+import TransfersView from '../transfers/TransfersView'
 import PlayerBlade from '../player/PlayerBlade'
 
 export default function AppShell() {
@@ -27,6 +28,7 @@ export default function AppShell() {
         {navTab === 'dashboard' && <Dashboard />}
         {navTab === 'squad'     && <SquadView />}
         {navTab === 'scouting'  && <ScoutingView />}
+        {navTab === 'transfers' && <TransfersView />}
       </main>
 
       {/* Inbox drawer (right panel) */}
@@ -43,27 +45,27 @@ export default function AppShell() {
       {/* Modals */}
       {activeModal === 'saveGame' && (
         <ModalShell title="Save Game" onClose={closeModal}>
-          <p className="text-zinc-400 text-sm">Save slot UI coming in Phase 6.</p>
+          <p className="text-zinc-400 text-sm">Save slot UI coming soon.</p>
         </ModalShell>
       )}
       {activeModal === 'loadGame' && (
         <ModalShell title="Load Game" onClose={closeModal}>
-          <p className="text-zinc-400 text-sm">Load slot UI coming in Phase 6.</p>
+          <p className="text-zinc-400 text-sm">Load slot UI coming soon.</p>
         </ModalShell>
       )}
       {activeModal === 'exportJson' && (
         <ModalShell title="Export Save" onClose={closeModal}>
-          <p className="text-zinc-400 text-sm">JSON export coming in Phase 6.</p>
+          <p className="text-zinc-400 text-sm">JSON export coming soon.</p>
         </ModalShell>
       )}
       {activeModal === 'importJson' && (
         <ModalShell title="Import Save" onClose={closeModal}>
-          <p className="text-zinc-400 text-sm">JSON import coming in Phase 6.</p>
+          <p className="text-zinc-400 text-sm">JSON import coming soon.</p>
         </ModalShell>
       )}
       {activeModal === 'simSettings' && (
         <ModalShell title="Simulation Settings" onClose={closeModal}>
-          <p className="text-zinc-400 text-sm">Sim settings coming in Phase 6.</p>
+          <p className="text-zinc-400 text-sm">Sim settings coming soon.</p>
         </ModalShell>
       )}
     </div>
