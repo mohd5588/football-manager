@@ -302,7 +302,7 @@ function ScoutingPlaceholder() {
 
 type DrawerTab = 'tactical' | 'scouting';
 
-export function InboxDrawer() {
+export default function InboxDrawer() {
   const [activeTab, setActiveTab] = useState<DrawerTab>('tactical');
 
   const items       = useInboxStore(selectInboxItems);

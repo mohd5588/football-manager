@@ -1,40 +1,17 @@
-/**
- * src/components/dashboard/Dashboard.tsx
- *
- * The "dashboard" tab — the default view when the game is active.
- *
- * Layout (two columns on wider viewports, stacked on narrow):
- *   Left  (primary):  Next Fixture card + League Table (compact)
- *   Right (secondary): Season summary metrics (Phase 6: Tremor cards)
- *
- * Phase 4 scope:
- *   - NextFixtureCard
- *   - LeagueTable (compact mode, centred on player's row)
- *   - Topbar with date and matchweek context
- *   - Placeholder metric cards (Phase 6 will wire real finance data)
- *
- * State sources (read-only):
- *   - gameStore → gameState for topbar context
- */
-
-import React from 'react';
-import { useGameStore, selectGameState, selectManagerClub } from '../../store/gameStore';
-import { NextFixtureCard } from './NextFixtureCard';
-import { LeagueTable } from './LeagueTable';
-
-// ---------------------------------------------------------------------------
-// Topbar
-// ---------------------------------------------------------------------------
+import React from 'react'
+import { useGameStore, selectGameState, selectManagerClub } from '../../store/gameStore'
+import NextFixtureCard from './NextFixtureCard'
+import LeagueTable from './LeagueTable'
+import XGChart from './XGChart'
 
 function formatDisplayDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-GB', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
-  });
+  })
 }
 
 function Topbar() {
-  const gameState = useGameStore(selectGameState);
-
+  const gameState = useGameStore(selectGameState)
   return (
     <div className="flex items-center gap-3 px-5 py-2.5 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
       <span className="text-sm font-medium text-gray-800 dark:text-gray-200">Dashboard</span>
@@ -49,18 +26,14 @@ function Topbar() {
         </>
       )}
     </div>
-  );
+  )
 }
 
-// ---------------------------------------------------------------------------
-// Placeholder metric card (Phase 6: replace with Tremor Metric component)
-// ---------------------------------------------------------------------------
-
 interface MetricCardProps {
-  label: string;
-  value: string;
-  sub?: string;
-  subColour?: 'green' | 'red' | 'neutral';
+  label: string
+  value: string
+  sub?: string
+  subColour?: 'green' | 'red' | 'neutral'
 }
 
 function MetricCard({ label, value, sub, subColour = 'neutral' }: MetricCardProps) {
@@ -68,7 +41,7 @@ function MetricCard({ label, value, sub, subColour = 'neutral' }: MetricCardProp
     green:   'text-green-600 dark:text-green-400',
     red:     'text-red-500 dark:text-red-400',
     neutral: 'text-gray-400 dark:text-gray-500',
-  }[subColour];
+  }[subColour]
 
   return (
     <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
@@ -78,20 +51,14 @@ function MetricCard({ label, value, sub, subColour = 'neutral' }: MetricCardProp
       <div className="text-xl font-medium text-gray-900 dark:text-gray-100">
         {value}
       </div>
-      {sub && (
-        <div className={`text-[11px] mt-0.5 ${subColourClass}`}>{sub}</div>
-      )}
+      {sub && <div className={`text-[11px] mt-0.5 ${subColourClass}`}>{sub}</div>}
     </div>
-  );
+  )
 }
 
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
-
-export function Dashboard() {
-  const gameState = useGameStore(selectGameState);
-  const club      = useGameStore(selectManagerClub);
+export default function Dashboard() {
+  const gameState = useGameStore(selectGameState)
+  const club      = useGameStore(selectManagerClub)
 
   if (!gameState || !club) {
     return (
@@ -104,17 +71,17 @@ export function Dashboard() {
           </div>
         </div>
       </div>
-    );
+    )
   }
 
-  const myRow     = gameState.playerStandingsRow;
-  const winRate   = myRow && myRow.played > 0
+  const myRow    = gameState.playerStandingsRow
+  const winRate  = myRow && myRow.played > 0
     ? Math.round((myRow.won / myRow.played) * 100)
-    : 0;
-  const balance   = club.finances.balance;
+    : 0
+  const balance    = club.finances.balance
   const balanceStr = balance >= 0
     ? `£${(balance / 1_000_000).toFixed(1)}m`
-    : `-£${(Math.abs(balance) / 1_000_000).toFixed(1)}m`;
+    : `-£${(Math.abs(balance) / 1_000_000).toFixed(1)}m`
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -123,10 +90,9 @@ export function Dashboard() {
       <div className="flex-1 overflow-y-auto">
         <div className="p-5 grid grid-cols-1 xl:grid-cols-[1fr_220px] gap-5 items-start">
 
-          {/* ── Left column ── */}
+          {/* Left column */}
           <div className="space-y-5">
 
-            {/* Next fixture */}
             <section>
               <div className="flex items-center justify-between mb-2.5">
                 <h2 className="text-[11px] font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
@@ -136,7 +102,6 @@ export function Dashboard() {
               <NextFixtureCard />
             </section>
 
-            {/* League table */}
             <section>
               <div className="flex items-center justify-between mb-2.5">
                 <h2 className="text-[11px] font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
@@ -146,9 +111,13 @@ export function Dashboard() {
               <LeagueTable compact />
             </section>
 
+            <section>
+              <XGChart />
+            </section>
+
           </div>
 
-          {/* ── Right column — season metrics ── */}
+          {/* Right column */}
           <div className="space-y-3">
             <h2 className="text-[11px] font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
               Season snapshot
@@ -185,7 +154,6 @@ export function Dashboard() {
               </div>
             )}
 
-            {/* Finance snapshot — Phase 6 replaces with live Tremor cards */}
             <div className="border-t border-gray-100 dark:border-gray-800 pt-3 mt-3 space-y-3">
               <h2 className="text-[11px] font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
                 Finances
@@ -206,16 +174,16 @@ export function Dashboard() {
                 subColour={club.finances.transferBudget > 500_000 ? 'green' : 'red'}
               />
             </div>
-
           </div>
+
         </div>
       </div>
     </div>
-  );
+  )
 }
 
 function ordinal(n: number): string {
-  const s = ['th', 'st', 'nd', 'rd'];
-  const v = n % 100;
-  return s[(v - 20) % 10] ?? s[v] ?? s[0];
+  const s = ['th', 'st', 'nd', 'rd']
+  const v = n % 100
+  return s[(v - 20) % 10] ?? s[v] ?? s[0]
 }

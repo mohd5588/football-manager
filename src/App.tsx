@@ -5,17 +5,6 @@
  *   Step 1 — Welcome screen (seed input + New Game button)
  *   Step 2 — Pick a tier  (4 cards: EPL / Championship / League One / League Two)
  *   Step 3 — Pick a club  (grid of clubs in the chosen tier)
- *
- * How the two-pass world generation works:
- *   Pass 1: INIT_LEAGUE with no playerClubId → worker generates clubs.
- *           We read those clubs to populate the picker. gameReady stays false
- *           so we don't jump to AppShell yet.
- *   Pass 2: INIT_LEAGUE with same seed + chosen clubId → worker regenerates
- *           the identical world but marks the correct club as player-managed.
- *           We then set gameReady = true → AppShell renders.
- *
- * Because the seed is fixed, both passes produce identical clubs/players.
- * The only difference is which club has isPlayerManaged = true.
  */
 
 import { useState, useMemo } from 'react';
@@ -26,7 +15,7 @@ import {
   selectIsSimulating,
 } from './store/gameStore';
 import { useUiStore } from './store/uiStore';
-import { AppShell } from './components/layout/AppShell';
+import AppShell from './components/layout/AppShell';
 import { Tier, TIER_CONFIG } from './types';
 
 // ---------------------------------------------------------------------------
@@ -49,10 +38,9 @@ const TIER_ORDER: Tier[] = [Tier.EPL, Tier.Championship, Tier.LeagueOne, Tier.Le
 // ---------------------------------------------------------------------------
 
 export default function App() {
-  const gameState   = useGameStore(selectGameState);
+  const gameState  = useGameStore(selectGameState);
   const [gameReady, setGameReady] = useState(false);
 
-  // Once the user has confirmed their club, gameReady flips to true
   if (gameReady && gameState) {
     return (
       <>
@@ -79,12 +67,11 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
   const gameState    = useGameStore(selectGameState);
   const pushToast    = useUiStore((s) => s.pushToast);
 
-  const [step, setStep]               = useState<SetupStep>('welcome');
-  const [seedInput, setSeedInput]     = useState('');
-  const [activeSeed, setActiveSeed]   = useState<number>(0);
+  const [step, setStep]                 = useState<SetupStep>('welcome');
+  const [seedInput, setSeedInput]       = useState('');
+  const [activeSeed, setActiveSeed]     = useState<number>(0);
   const [selectedTier, setSelectedTier] = useState<Tier | null>(null);
 
-  // All clubs for the chosen tier (populated after pass-1 world gen)
   const tierClubs = useMemo(() => {
     if (!gameState || !selectedTier) return [];
     return Object.values(gameState.clubs)
@@ -92,37 +79,31 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [gameState, selectedTier]);
 
-  // ── Step 1 → 2: generate world for preview, then show tier picker ─────────
   async function handleStart() {
     const seed = seedInput ? parseInt(seedInput, 10) : Math.floor(Math.random() * 999_999);
     setActiveSeed(seed);
     try {
-      // Pass 1 — no player club yet, just get the clubs generated
       await simulationService.initLeague({ seed, managerClubId: null } as any);
       setStep('pick_tier');
     } catch (err) {
-      pushToast(`Failed to generate world: ${(err as Error).message}`, 'error', 0);
+      pushToast(`Failed to generate world: ${(err as Error).message}`, 'error');
     }
   }
 
-  // ── Step 2 → 3: user picks a tier ────────────────────────────────────────
   function handlePickTier(tier: Tier) {
     setSelectedTier(tier);
     setStep('pick_club');
   }
 
-  // ── Step 3: user picks a club → pass-2 init, then enter dashboard ─────────
   async function handlePickClub(clubId: string) {
     try {
-      // Pass 2 — same seed, now with the chosen club marked as player-managed
       await simulationService.initLeague({ seed: activeSeed, managerClubId: clubId } as any);
       onReady();
     } catch (err) {
-      pushToast(`Failed to start game: ${(err as Error).message}`, 'error', 0);
+      pushToast(`Failed to start game: ${(err as Error).message}`, 'error');
     }
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-sans flex flex-col">
 
@@ -134,7 +115,6 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
           <p className="text-xs text-gray-500">English Football — 92 Clubs · 4 Tiers</p>
         </div>
 
-        {/* Step indicator */}
         {step !== 'welcome' && (
           <div className="ml-auto flex items-center gap-2">
             {(['welcome', 'pick_tier', 'pick_club'] as SetupStep[]).map((s, i) => (
@@ -155,7 +135,7 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
 
       <main className="flex-1 flex items-center justify-center px-6 py-12">
 
-        {/* ── Step 1: Welcome ── */}
+        {/* Step 1: Welcome */}
         {step === 'welcome' && (
           <div className="w-full max-w-lg text-center space-y-8">
             <div>
@@ -205,7 +185,7 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
           </div>
         )}
 
-        {/* ── Step 2: Pick tier ── */}
+        {/* Step 2: Pick tier */}
         {step === 'pick_tier' && (
           <div className="w-full max-w-2xl space-y-6">
             <div className="text-center">
@@ -243,17 +223,14 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
             </div>
 
             <div className="text-center">
-              <button
-                onClick={() => setStep('welcome')}
-                className="text-xs text-gray-500 hover:text-gray-400 transition-colors"
-              >
+              <button onClick={() => setStep('welcome')} className="text-xs text-gray-500 hover:text-gray-400 transition-colors">
                 ← Back
               </button>
             </div>
           </div>
         )}
 
-        {/* ── Step 3: Pick club ── */}
+        {/* Step 3: Pick club */}
         {step === 'pick_club' && selectedTier && (
           <div className="w-full max-w-3xl space-y-6">
             <div className="text-center">
@@ -268,7 +245,6 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
 
             <div className="grid grid-cols-2 gap-2.5 max-h-[60vh] overflow-y-auto pr-1">
               {tierClubs.map((club) => {
-                // Average current ability across all the club's players
                 const clubPlayers = gameState
                   ? Object.values(gameState.players).filter((p) => p.clubId === club.id)
                   : [];
@@ -283,23 +259,19 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
                     disabled={isSimulating}
                     className="flex items-center gap-3 p-4 rounded-xl bg-gray-900 border border-gray-800 hover:border-gray-600 hover:bg-gray-800 text-left transition-all disabled:opacity-50 group"
                   >
-                    {/* Crest initials */}
                     <div className="w-10 h-10 rounded-lg bg-gray-800 group-hover:bg-gray-700 flex items-center justify-center flex-shrink-0 transition-colors">
                       <span className="text-xs font-bold text-gray-300">
                         {club.shortName.slice(0, 3).toUpperCase()}
                       </span>
                     </div>
-
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-semibold text-white truncate">{club.name}</div>
                       <div className="text-xs text-gray-500 truncate">{club.city}</div>
                     </div>
-
                     <div className="flex-shrink-0 text-right">
                       <div className="text-xs font-bold text-gray-300">{avgAbility}</div>
                       <div className="text-[9px] text-gray-600">ability</div>
                     </div>
-
                     {isSimulating && (
                       <svg className="animate-spin h-3.5 w-3.5 text-blue-500 ml-auto flex-shrink-0" fill="none" viewBox="0 0 24 24">
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
@@ -312,10 +284,7 @@ function NewGameFlow({ onReady }: { onReady: () => void }) {
             </div>
 
             <div className="text-center">
-              <button
-                onClick={() => setStep('pick_tier')}
-                className="text-xs text-gray-500 hover:text-gray-400 transition-colors"
-              >
+              <button onClick={() => setStep('pick_tier')} className="text-xs text-gray-500 hover:text-gray-400 transition-colors">
                 ← Back to tier selection
               </button>
             </div>
@@ -340,7 +309,6 @@ function ToastStack() {
   const COLOURS: Record<string, string> = {
     info:    'bg-gray-800 border-gray-700 text-gray-100',
     success: 'bg-emerald-900 border-emerald-700 text-emerald-100',
-    warning: 'bg-amber-900 border-amber-700 text-amber-100',
     error:   'bg-red-900 border-red-700 text-red-100',
   };
 
@@ -349,7 +317,7 @@ function ToastStack() {
       {toasts.map((t) => (
         <div
           key={t.id}
-          className={`flex items-start gap-3 px-4 py-3 rounded-lg border text-sm shadow-xl max-w-sm ${COLOURS[t.variant]}`}
+          className={`flex items-start gap-3 px-4 py-3 rounded-lg border text-sm shadow-xl max-w-sm ${COLOURS[t.type] ?? COLOURS.info}`}
         >
           <span className="flex-1">{t.message}</span>
           <button onClick={() => dismiss(t.id)} className="opacity-60 hover:opacity-100 text-xs ml-2 mt-0.5">✕</button>

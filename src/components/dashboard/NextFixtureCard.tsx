@@ -167,7 +167,7 @@ function TeamBadge({ shortName, isHome }: { shortName: string; isHome: boolean }
 // Component
 // ---------------------------------------------------------------------------
 
-export function NextFixtureCard() {
+export default function NextFixtureCard() {
   const gameState = useGameStore(selectGameState);
   const club      = useGameStore(selectManagerClub);
 

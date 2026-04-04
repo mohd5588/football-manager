@@ -32,12 +32,12 @@ function getMatchweekEnd(date: string): string {
   return d.toISOString().split('T')[0];
 }
 
-export function SimulateControl() {
+export default function SimulateControl() {
   const isSimulating     = useGameStore(selectIsSimulating);
   const progress         = useGameStore(selectProgress);
   const gameState        = useGameStore(selectGameState);
   const currentAttention = useInboxStore(selectCurrentAttention);
-  const setActiveTab     = useUiStore((s) => s.setActiveTab);
+  const setNavTab        = useUiStore((s) => s.setNavTab);   // ← was setActiveTab
   const resolveAttention = useInboxStore((s) => s.resolveAttention);
 
   const [simMode, setSimMode] = useState<SimMode>('to_fixture');
@@ -80,9 +80,9 @@ export function SimulateControl() {
   const handleAttentionPrimary = useCallback(
     (ev: NonNullable<typeof currentAttention>) => {
       resolveAttention(ev.id);
-      if (ev.primaryTab) setActiveTab(ev.primaryTab as NavTab);
+      if (ev.primaryTab) setNavTab(ev.primaryTab as NavTab);  // ← was setActiveTab
     },
-    [resolveAttention, setActiveTab]
+    [resolveAttention, setNavTab]
   );
 
   const handleAttentionSecondary = useCallback(
@@ -160,7 +160,7 @@ export function SimulateControl() {
   return (
     <div className="flex flex-col gap-1.5">
 
-      {/* Mode selector — three pill buttons in a row */}
+      {/* Mode selector */}
       <div className="flex gap-1">
         {MODES.map(({ mode, label }) => (
           <button

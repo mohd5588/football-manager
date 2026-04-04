@@ -1,32 +1,5 @@
 /**
  * src/components/dashboard/LeagueTable.tsx
- *
- * Renders a standings table for any tier with:
- *   - Inline raw SVG form sparklines (5 dots — no library, 60fps guaranteed)
- *   - Zone highlighting (promotion / playoff / relegation) derived from TIER_CONFIG
- *   - Player-managed club row highlighted in blue
- *   - Club name click → uiStore.selectClub() (opens Club Profile blade)
- *   - Abbreviated "mid-table" rows to keep the dashboard compact;
- *     a "Full table →" link navigates to the Standings tab
- *
- * Performance contract:
- *   The sparkline is 5 raw <circle> elements inside a tiny <svg>.
- *   No Canvas, no Chart.js, no Recharts — this component must stay
- *   render-cheap because it lives in a scrollable container.
- *
- * State sources:
- *   - gameStore → standings, playerClubId
- *   - uiStore   → selectClub (write), setActiveTab (write)
- *
- * BUG FIXES (Phase 4):
- *   1. `visibleRows` was computed but the tbody iterated `rows` directly.
- *      Now the tbody iterates `visibleRows` and handles the 'separator' sentinel.
- *   2. Worker initialises StandingsRow.position = 0 in pre-season, causing
- *      getZone() to return 'none' for every row (zone colours invisible).
- *      Rows are now position-normalised before zone calculation so the correct
- *      zone colours render from kick-off of the season.
- *   3. Rows are deduplicated by clubId before rendering to guard against the
- *      world-gen double-insert bug that made the player club appear twice.
  */
 
 import React, { useMemo } from 'react';
@@ -39,22 +12,20 @@ import { TIER_CONFIG, type Tier, type StandingsRow } from '../../types';
 // ---------------------------------------------------------------------------
 
 const FORM_COLOURS = {
-  W: '#16a34a', // green-600
-  D: '#9ca3af', // gray-400
-  L: '#dc2626', // red-600
+  W: '#16a34a',
+  D: '#9ca3af',
+  L: '#dc2626',
 } as const;
 
 function FormSparkline({ form }: { form: string }) {
-  // Take the last 5 characters of the form string, keep only valid result chars.
   const chars = form
     .slice(-5)
     .split('')
     .filter((c): c is keyof typeof FORM_COLOURS => c in FORM_COLOURS);
 
-  // Pre-season: no matches played yet → form is empty → render nothing.
   if (chars.length === 0) return null;
 
-  const w = chars.length * 9 - 2; // 5 dots × 9px spacing − trailing gap
+  const w = chars.length * 9 - 2;
 
   return (
     <svg
@@ -78,7 +49,7 @@ function FormSparkline({ form }: { form: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Zone logic — derived purely from TIER_CONFIG constants
+// Zone logic
 // ---------------------------------------------------------------------------
 
 type Zone = 'promotion' | 'playoff' | 'relegation' | 'none';
@@ -101,16 +72,11 @@ const ZONE_LEFT_BORDER: Record<Zone, string> = {
   none:       'border-l-2 border-l-transparent',
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 function formatGD(gd: number): string {
   if (gd > 0) return `+${gd}`;
   return String(gd);
 }
 
-// How many rows to show above and below the player's row in compact mode.
 const COMPACT_CONTEXT = 3;
 
 // ---------------------------------------------------------------------------
@@ -118,7 +84,6 @@ const COMPACT_CONTEXT = 3;
 // ---------------------------------------------------------------------------
 
 interface LeagueTableProps {
-  /** Limit rows for the dashboard compact view. Omit for full standings page. */
   compact?: boolean;
 }
 
@@ -126,46 +91,28 @@ interface LeagueTableProps {
 // Component
 // ---------------------------------------------------------------------------
 
-export function LeagueTable({ compact = false }: LeagueTableProps) {
+export default function LeagueTable({ compact = false }: LeagueTableProps) {
   const gameState    = useGameStore(selectGameState);
   const selectClub   = useUiStore((s) => s.selectClub);
-  const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   const tier         = gameState?.playerClub?.currentTier;
   const playerClubId = gameState?.playerClubId;
 
-  // ── FIX 1 + FIX 2: normalise and deduplicate rows ──────────────────────
-  //
-  // The worker initialises StandingsRow.position = 0 in pre-season which
-  // breaks zone colour logic. Map each row so position is always ≥ 1,
-  // falling back to the sorted array index when the worker hasn't set it yet.
-  //
-  // Deduplication (FIX 3) guards against the world-gen double-insert bug
-  // where the player-managed club is pushed into the standings array twice.
   const rows = useMemo<StandingsRow[]>(() => {
     const raw: StandingsRow[] = (tier ? gameState?.standings[tier] : undefined) ?? [];
 
     const seen = new Set<string>();
     return raw
       .filter((row) => {
-        // Deduplicate — keep first occurrence of each clubId.
         if (seen.has(row.clubId)) return false;
         seen.add(row.clubId);
         return true;
       })
       .map((row, idx) =>
-        // Normalise position: if the worker hasn't set it yet (0 or negative),
-        // derive it from the sorted array index so zone colours are correct
-        // from day 1 of the season.
         row.position > 0 ? row : { ...row, position: idx + 1 }
       );
   }, [gameState, tier]);
 
-  // ── FIX 1: visibleRows is now the array the tbody actually renders ───────
-  //
-  // Previously visibleRows was computed but rows was rendered — the compact
-  // window was effectively dead code. Now visibleRows drives the render and
-  // the 'separator' sentinel is handled explicitly in the map below.
   const visibleRows = useMemo<Array<StandingsRow | 'separator'>>(() => {
     if (!compact || !playerClubId) return rows;
 
@@ -193,9 +140,6 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
     );
   }
 
-  // Zone separator label positions — insert labels before the first row of a new zone.
-  // Only relevant when rendering the full table (compact=false); in compact mode the
-  // zone boundary may not be visible but the labels still render for any rows present.
   const promotionEnd = TIER_CONFIG[tier].autoPromotionSlots;
   const playoffEnd   = promotionEnd + TIER_CONFIG[tier].playoffEntrants;
   const relegStart   = TIER_CONFIG[tier].clubCount - TIER_CONFIG[tier].autoRelegationSlots + 1;
@@ -203,7 +147,6 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
   return (
     <div className="rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 overflow-hidden">
       <table className="w-full text-xs border-collapse" style={{ tableLayout: 'fixed' }}>
-        {/* col order: # | Club (flex) | P | W | D | L | GD | Form | Pts */}
         <colgroup>
           <col style={{ width: '26px' }} />
           <col />
@@ -233,12 +176,8 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
         </thead>
 
         <tbody>
-          {/* ── FIX 1: iterate visibleRows, not rows ─────────────────────── */}
           {visibleRows.map((row, idx) => {
 
-            // ── Compact ellipsis separator ────────────────────────────────
-            // The 'separator' sentinel is inserted by the visibleRows memo to
-            // indicate rows above/below the compact window have been hidden.
             if (row === 'separator') {
               return (
                 <tr key={`sep-${idx}`} className="border-b border-gray-100 dark:border-gray-800">
@@ -253,13 +192,9 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
             }
 
             const isPlayer = row.clubId === playerClubId;
-            // row.position is guaranteed ≥ 1 after the normalisation above.
             const zone     = getZone(row.position, tier);
             const club     = gameState.clubs[row.clubId];
 
-            // Insert zone label rows for the full-table view.
-            // These fire on position boundaries regardless of compact mode —
-            // if the boundary falls inside the compact window the label still renders.
             const separatorBefore: string | null =
               row.position === promotionEnd + 1 && TIER_CONFIG[tier].playoffEntrants > 0
                 ? `Playoff zone (${promotionEnd + 1}–${playoffEnd})`
@@ -292,12 +227,9 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
                     transition-colors
                   `}
                 >
-                  {/* Position */}
                   <td className="py-1.5 pl-2.5 pr-1 text-gray-400 dark:text-gray-500 text-right">
                     {row.position}
                   </td>
-
-                  {/* Club name */}
                   <td className="py-1.5 px-1.5">
                     <button
                       onClick={() => selectClub(row.clubId)}
@@ -313,30 +245,22 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
                       )}
                     </button>
                   </td>
-
-                  {/* Stats */}
                   {[row.played, row.won, row.drawn, row.lost].map((val, i) => (
                     <td key={i} className="py-1.5 px-1.5 text-right text-gray-500 dark:text-gray-400">
                       {val}
                     </td>
                   ))}
-
-                  {/* Goal difference */}
                   <td className={`py-1.5 px-1.5 text-right font-medium
                     ${row.goalDifference > 0 ? 'text-green-600 dark:text-green-400' :
                       row.goalDifference < 0 ? 'text-red-500 dark:text-red-400' :
                       'text-gray-400 dark:text-gray-500'}`}>
                     {formatGD(row.goalDifference)}
                   </td>
-
-                  {/* Form sparkline */}
                   <td className="py-1.5 px-1.5 text-right">
                     <div className="flex justify-end">
                       <FormSparkline form={row.form} />
                     </div>
                   </td>
-
-                  {/* Points */}
                   <td className={`py-1.5 pr-2.5 text-right font-medium
                     ${isPlayer
                       ? 'text-blue-700 dark:text-blue-300'
@@ -350,17 +274,6 @@ export function LeagueTable({ compact = false }: LeagueTableProps) {
           })}
         </tbody>
       </table>
-
-      {compact && (
-        <div className="border-t border-gray-100 dark:border-gray-800 py-2 px-3 text-center">
-          <button
-            onClick={() => setActiveTab('standings')}
-            className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
-          >
-            Full table →
-          </button>
-        </div>
-      )}
     </div>
   );
 }
