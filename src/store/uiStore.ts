@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type NavTab = 'dashboard' | 'squad' | 'scouting' | 'transfers'
+export type NavTab = 'dashboard' | 'squad' | 'scouting' | 'transfers' | 'inbox'
 export type ModalId = 'newGame' | 'saveGame' | 'loadGame' | 'exportJson' | 'importJson' | 'simSettings'
 export type SimMode = 'to_fixture' | 'one_day' | 'matchweek'
 
@@ -17,6 +17,7 @@ interface UiState {
   simMode: SimMode
   setSimMode: (mode: SimMode) => void
 
+  // kept for backwards compat but no longer drives the inbox UI
   inboxOpen: boolean
   setInboxOpen: (open: boolean) => void
 

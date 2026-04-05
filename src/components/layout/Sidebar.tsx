@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { id: 'squad'      as const, label: 'Squad',      icon: '👥' },
   { id: 'transfers'  as const, label: 'Transfers',  icon: '💸' },
   { id: 'scouting'   as const, label: 'Scouting',   icon: '🔭' },
+  { id: 'inbox'      as const, label: 'Inbox',      icon: '📬' },
 ] as const
 
 const TIER_LABELS = ['EPL', 'Championship', 'League One', 'League Two']
@@ -18,8 +19,8 @@ function fmt(amount: number) {
 
 export default function Sidebar() {
   const gameState = useGameStore(selectGameState)
-  const { navTab, setNavTab, inboxOpen, setInboxOpen, openModal } = useUiStore()
-  const unread = useInboxStore((s) => s.items.filter((i) => !i.read).length)
+  const { navTab, setNavTab, openModal } = useUiStore()
+  const unread    = useInboxStore((s) => s.items.filter((i) => !i.isRead).length)
 
   const club     = gameState?.playerClub
   const season   = gameState?.season ?? '—'
@@ -72,26 +73,14 @@ export default function Sidebar() {
           >
             <span className="text-base leading-none w-5 text-center">{icon}</span>
             <span className="flex-1">{label}</span>
+            {/* Unread badge on the Inbox nav item */}
+            {id === 'inbox' && unread > 0 && (
+              <span className="bg-red-500 text-white text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1">
+                {unread > 9 ? '9+' : unread}
+              </span>
+            )}
           </button>
         ))}
-
-        {/* Inbox toggle */}
-        <button
-          onClick={() => setInboxOpen(!inboxOpen)}
-          className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-left transition-colors ${
-            inboxOpen
-              ? 'bg-zinc-700 text-white'
-              : 'text-zinc-400 hover:bg-zinc-800 hover:text-white'
-          }`}
-        >
-          <span className="text-base leading-none w-5 text-center">📬</span>
-          <span className="flex-1">Inbox</span>
-          {unread > 0 && (
-            <span className="bg-red-500 text-white text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1">
-              {unread > 9 ? '9+' : unread}
-            </span>
-          )}
-        </button>
       </nav>
 
       {/* Simulate control */}

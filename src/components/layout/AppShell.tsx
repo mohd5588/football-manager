@@ -1,20 +1,18 @@
 import React from 'react'
 import { useUiStore } from '../../store/uiStore'
 import Sidebar from './Sidebar'
-import InboxDrawer from './InboxDrawer'
 import Dashboard from '../dashboard/Dashboard'
 import SquadView from '../squad/SquadView'
 import ScoutingView from '../scouting/ScoutingView'
 import TransfersView from '../transfers/TransfersView'
+import InboxView from '../inbox/InboxView'
 import PlayerBlade from '../player/PlayerBlade'
 
 export default function AppShell() {
   const {
     navTab,
-    inboxOpen,
     selectedPlayerId, selectPlayer,
     activeModal, closeModal,
-    openModal,
   } = useUiStore()
 
   return (
@@ -23,16 +21,14 @@ export default function AppShell() {
       {/* Sidebar */}
       <Sidebar />
 
-      {/* Main content */}
+      {/* Main content — full width, no right drawer */}
       <main className="flex-1 min-w-0 overflow-y-auto">
         {navTab === 'dashboard' && <Dashboard />}
         {navTab === 'squad'     && <SquadView />}
         {navTab === 'scouting'  && <ScoutingView />}
         {navTab === 'transfers' && <TransfersView />}
+        {navTab === 'inbox'     && <InboxView />}
       </main>
-
-      {/* Inbox drawer (right panel) */}
-      {inboxOpen && <InboxDrawer />}
 
       {/* Player blade overlay */}
       {selectedPlayerId && (
