@@ -1,15 +1,10 @@
 /**
  * worldGen.ts — The World Generator
  *
- * Plain English: When you start a new game, this file runs ONCE and
- * creates the entire football world from scratch:
- *   - 92 fictional clubs (20 EPL, 24 Championship, 24 L1, 24 L2)
- *   - ~20 players per club (~1,840 players total)
- *   - Realistic attribute distributions per tier
- *   - Geography-based fictional names (e.g. "Preston Rovers")
- *
- * It uses a "seed" number so the same seed always produces the exact
- * same world — useful for debugging and for sharing worlds with friends.
+ * Phase 7 additions:
+ *   ✅ stadiumCapacity per club — tier-scaled random range, rounded to nearest 1000
+ *   ✅ stadiumRevenue calculated from capacity × revenue-per-seat (replaces static value)
+ *   ✅ morale: 60 initialised on every generated player
  */
 
 import {
@@ -164,8 +159,11 @@ function generatePlayer(
   const potentialBonus = age < 23 ? randInt(5, 25, rng) : randInt(0, 8, rng);
   const potential      = Math.min(99, currentAbility + potentialBonus);
 
-  // Weekly wage: ability * £200/week. An EPL star (80 OVR) earns ~£16k/wk.
   const weeklyWage = currentAbility * 200;
+
+  // Morale starts at a neutral 60 for all generated players.
+  // It will fluctuate during the season based on results.
+  const morale = 60;
 
   return {
     id:              crypto.randomUUID(),
@@ -179,6 +177,7 @@ function generatePlayer(
     status:          'active',
     unavailableWeeks: 0,
     weeklyWage,
+    morale,
     seasonStats: {
       appearances:   0,
       goals:         0,
@@ -195,28 +194,49 @@ function generatePlayer(
 // § 6 · Club Finances — Tier-scaled starting budgets
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Stadium capacity ranges (min, max) per tier.
+ * Rounded to the nearest 1,000 during generation.
+ */
+const STADIUM_CAPACITY_RANGES: Record<Tier, [number, number]> = {
+  [Tier.EPL]:          [25_000, 60_000],
+  [Tier.Championship]: [12_000, 32_000],
+  [Tier.LeagueOne]:    [6_000,  18_000],
+  [Tier.LeagueTwo]:    [3_000,  10_000],
+};
+
+/**
+ * Revenue earned per seat per home match (GBP).
+ * An EPL club with a 40k stadium earns ~£1.8M per home game.
+ */
+const STADIUM_REVENUE_PER_SEAT: Record<Tier, number> = {
+  [Tier.EPL]:          45,
+  [Tier.Championship]: 22,
+  [Tier.LeagueOne]:    12,
+  [Tier.LeagueTwo]:    8,
+};
+
 interface TierFinanceBase {
   balance:        number;
   wageBill:       number;
   transferBudget: number;
-  stadiumRevenue: number;
 }
 
 const FINANCE_BASES: Record<Tier, TierFinanceBase> = {
-  [Tier.EPL]:          { balance: 50_000_000, wageBill: 2_000_000, transferBudget: 20_000_000, stadiumRevenue: 3_000_000 },
-  [Tier.Championship]: { balance: 10_000_000, wageBill:   400_000, transferBudget:  3_000_000, stadiumRevenue:   500_000 },
-  [Tier.LeagueOne]:    { balance:  2_000_000, wageBill:    80_000, transferBudget:    500_000, stadiumRevenue:   100_000 },
-  [Tier.LeagueTwo]:    { balance:    500_000, wageBill:    20_000, transferBudget:    100_000, stadiumRevenue:    30_000 },
+  [Tier.EPL]:          { balance: 50_000_000, wageBill: 2_000_000, transferBudget: 20_000_000 },
+  [Tier.Championship]: { balance: 10_000_000, wageBill:   400_000, transferBudget:  3_000_000 },
+  [Tier.LeagueOne]:    { balance:  2_000_000, wageBill:    80_000, transferBudget:    500_000 },
+  [Tier.LeagueTwo]:    { balance:    500_000, wageBill:    20_000, transferBudget:    100_000 },
 };
 
-function generateFinances(tier: Tier, rng: Rng) {
-  const base  = FINANCE_BASES[tier];
-  const vary  = (v: number) => Math.round(v * (0.5 + rng()));
+function generateFinances(tier: Tier, rng: Rng, stadiumRevenue: number) {
+  const base = FINANCE_BASES[tier];
+  const vary = (v: number) => Math.round(v * (0.5 + rng()));
   return {
     balance:        vary(base.balance),
     wageBill:       vary(base.wageBill),
     transferBudget: vary(base.transferBudget),
-    stadiumRevenue: vary(base.stadiumRevenue),
+    stadiumRevenue, // derived from actual capacity — NOT randomised
   };
 }
 
@@ -248,6 +268,12 @@ function generateClub(
   const clubId:   EntityId = crypto.randomUUID();
   const tierMean: number   = TIER_CONFIG[tier].meanAttributeScore;
 
+  // Stadium capacity — random within tier range, rounded to nearest 1,000
+  const [minCap, maxCap] = STADIUM_CAPACITY_RANGES[tier];
+  const rawCapacity = randInt(minCap, maxCap, rng);
+  const stadiumCapacity = Math.round(rawCapacity / 1_000) * 1_000;
+  const stadiumRevenue  = stadiumCapacity * STADIUM_REVENUE_PER_SEAT[tier];
+
   const players:    Player[]   = [];
   const startingXI: EntityId[] = [];
   const bench:      EntityId[] = [];
@@ -268,6 +294,7 @@ function generateClub(
     tier,
     currentTier:   tier,
     isPlayerManaged: false,
+    stadiumCapacity,
     tactics: {
       formation:      '4-3-3' as Formation,
       mentality:      'balanced' as Mentality,
@@ -275,7 +302,7 @@ function generateClub(
       startingXI,
       bench: bench.slice(0, 5),
     },
-    finances: generateFinances(tier, rng),
+    finances: generateFinances(tier, rng, stadiumRevenue),
   };
 
   return { club, players };

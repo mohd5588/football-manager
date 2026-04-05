@@ -2,22 +2,20 @@
  * sim.worker.ts — The Simulation Engine (Background Thread)
  *
  * Phase 6 additions:
- *   ✅ Matchday revenue added to home club's balance after every match
- *   ✅ Weekly wage bill deducted from every club every Monday
- *   ✅ AI transfer bids generated on the 1st of each month
- *   ✅ MAKE_TRANSFER_OFFER — manager buys a player from an AI club
- *   ✅ ACCEPT_BID — manager accepts an AI club's offer for their player
- *   ✅ REJECT_BID — manager rejects a bid, removes it from pendingBids
- *   ✅ recalculateWageBill() keeps club.finances.wageBill accurate after transfers
+ *   ✅ Matchday revenue, weekly wages, AI bids, transfers, retirement, youth academy
  *
- * Phase 6 Part 2 additions:
- *   ✅ Probabilistic retirement — chance rises steeply from age 32, peaks ~97% at 38+
- *      Outliers can play to 39–40 but it's rare. No hard cutoff.
- *   ✅ Age increment — all players gain 1 year at season end
- *   ✅ Youth academy — each club topped up to 20 players with 16–17 year olds
- *      (currentAbility 30–45, potential 55–80) after retirement processing
- *   ✅ Season rollover — standings reset, new fixtures generated, season++ on
- *      transition to off_season once all league matches are complete
+ * Phase 7 additions:
+ *   ✅ MORALE — per-player morale (0–100) modifies match-engine lambda ±5%.
+ *      Rises +3 after a win, falls -3 after a loss, -5 extra after 3 consecutive losses.
+ *      Soft-resets toward 60 each off-season.
+ *   ✅ MANAGER REPUTATION — career score (0–100), starts at 50. Updated per match
+ *      (+0.2 win, -0.1 loss, -0.4 heavy loss) and +10 for winning the league.
+ *   ✅ SPONSORSHIPS — 2–3 offers generated at start of each pre_season. Manager
+ *      accepts one → first payment immediate, subsequent payments in processSeasonEnd.
+ *   ✅ STADIUM UPGRADES — UPGRADE_STADIUM action adds seats, recalculates
+ *      stadiumRevenue (capacity × tier revenue-per-seat). Cost = capacity × 100.
+ *   ✅ LOANS — LOAN_IN_PLAYER and LOAN_OUT_PLAYER. player.clubId changes temporarily.
+ *      All loans return at season end via processSeasonEnd.
  */
 
 import {
@@ -32,6 +30,9 @@ import {
   type TransferBid,
   type Player,
   type Position,
+  type SponsorshipOffer,
+  type ActiveSponsorship,
+  type LoanRecord,
 } from '../types';
 import { generateWorld } from './engine/worldGen';
 
@@ -94,12 +95,10 @@ function isBefore(a: string, b: string): boolean {
   return a < b;
 }
 
-/** Returns true if the ISO date falls on a Monday (UTC). */
 function isMonday(iso: string): boolean {
   return parseDate(iso).getUTCDay() === 1;
 }
 
-/** Returns true if the ISO date is the 1st day of a month. */
 function isFirstOfMonth(iso: string): boolean {
   return iso.endsWith('-01');
 }
@@ -108,10 +107,6 @@ function isFirstOfMonth(iso: string): boolean {
 // Economy Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Recalculate a club's wageBill as the sum of all its players' weeklyWage.
- * Called after any transfer so the sidebar finance strip stays accurate.
- */
 function recalculateWageBill(clubId: string): void {
   if (!state) return;
   const club = state.clubs[clubId];
@@ -123,22 +118,44 @@ function recalculateWageBill(clubId: string): void {
 }
 
 /**
- * Deduct each club's weekly wage bill on Mondays.
- * Plain English: every Monday the game "pays the players" from the club's bank.
+ * Revenue per seat per home match (GBP) — mirrors worldGen constant.
+ * Used when recalculating stadiumRevenue after a capacity upgrade.
  */
+const REVENUE_PER_SEAT: Record<string, number> = {
+  [Tier.EPL]:          45,
+  [Tier.Championship]: 22,
+  [Tier.LeagueOne]:    12,
+  [Tier.LeagueTwo]:    8,
+};
+
+/**
+ * Upgrade cost per added seat (GBP).
+ * An EPL club adds 5k seats for 5000 × (capacity/1000) × 100.
+ * Scales with existing size so big expansions cost more.
+ */
+function stadiumUpgradeCost(currentCapacity: number, capacityIncrease: number): number {
+  return Math.round(currentCapacity * 100 * (capacityIncrease / 5_000));
+}
+
 function processEndOfDay(date: string): void {
   if (!state) return;
+  // Pay wages every Monday
   if (isMonday(date)) {
     for (const club of Object.values(state.clubs)) {
       club.finances.balance -= club.finances.wageBill;
     }
+    // Morale penalty if the manager's club can't cover wages (negative balance)
+    const managerClub = state.clubs[state.playerClubId];
+    if (managerClub && managerClub.finances.balance < 0) {
+      for (const player of Object.values(state.players)) {
+        if (player.clubId === state.playerClubId) {
+          (player as any).morale = Math.max(0, (player.morale ?? 60) - 5);
+        }
+      }
+    }
   }
 }
 
-/**
- * Generate AI transfer bids targeting the manager's best players.
- * Called on the 1st of each month during regular_season.
- */
 function generateAIBids(): void {
   if (!state) return;
   if (state.phase !== 'regular_season') return;
@@ -187,32 +204,143 @@ function generateAIBids(): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Youth Academy & Retirement
+// Phase 7 — Morale Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Retirement probability curve.
- *
- * Plain English: players aged under 32 never retire at season end.
- * From 32 onwards the chance climbs steeply — most players are gone by 37,
- * but a small number of outliers can play into their late 30s / early 40s.
- *
- * Age → chance:
- *   32 →  8%   (rare early retirement)
- *   33 → 23%
- *   34 → 38%
- *   35 → 53%   (more than half retire at 35)
- *   36 → 68%
- *   37 → 83%
- *   38 → 97%   (capped — almost certain, but a tiny chance of one more year)
- *   39+ → 97%
+ * Update player morale after a match.
+ * Winners get +3, losers get -3. Three consecutive losses add a further -5.
  */
+function updateMoraleAfterMatch(report: MatchReport, fixture: Fixture): void {
+  if (!state) return;
+  const hg = report.homeStats.goals;
+  const ag = report.awayStats.goals;
+
+  const winnerClubId = hg > ag ? fixture.homeClubId : ag > hg ? fixture.awayClubId : null;
+  const loserClubId  = hg > ag ? fixture.awayClubId : ag > hg ? fixture.homeClubId : null;
+
+  const homeXI = getStartingXI(fixture.homeClubId);
+  const awayXI = getStartingXI(fixture.awayClubId);
+  const allXI  = [...homeXI, ...awayXI];
+
+  for (const pid of allXI) {
+    const p = state.players[pid];
+    if (!p) continue;
+    const isWinner = p.clubId === winnerClubId;
+    const isLoser  = p.clubId === loserClubId;
+    if (isWinner)     (p as any).morale = Math.min(100, (p.morale ?? 60) + 3);
+    else if (isLoser) (p as any).morale = Math.max(0,   (p.morale ?? 60) - 3);
+  }
+
+  // Extra -5 for clubs on 3-match losing run
+  const applyMoraleCrisis = (clubId: string | null) => {
+    if (!clubId) return;
+    const row = (state!.standings as Record<string, any[]>)[fixture.tier]?.find(
+      (r: any) => r.clubId === clubId
+    );
+    if (row && typeof row.form === 'string' && row.form.slice(-3) === 'LLL') {
+      const xi = fixture.homeClubId === clubId ? homeXI : awayXI;
+      for (const pid of xi) {
+        const p = state!.players[pid];
+        if (p) (p as any).morale = Math.max(0, (p.morale ?? 60) - 5);
+      }
+    }
+  };
+  applyMoraleCrisis(loserClubId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 7 — Manager Reputation
+// ─────────────────────────────────────────────────────────────────────────────
+
+function updateManagerReputation(report: MatchReport, fixture: Fixture): void {
+  if (!state) return;
+  const pid = state.playerClubId;
+  const isHome = fixture.homeClubId === pid;
+  const isAway = fixture.awayClubId === pid;
+  if (!isHome && !isAway) return;
+
+  const myGoals  = isHome ? report.homeStats.goals : report.awayStats.goals;
+  const oppGoals = isHome ? report.awayStats.goals : report.homeStats.goals;
+  const gd       = myGoals - oppGoals;
+
+  let delta = 0;
+  if      (gd > 0)   delta = 0.2;
+  else if (gd < 0)   delta = -0.1;
+  if      (gd <= -3) delta -= 0.4;  // heavy loss
+
+  const current = state.managerReputation ?? 50;
+  (state as any).managerReputation = Math.max(0, Math.min(100, current + delta));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 7 — Sponsorship
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SPONSOR_NAMES = [
+  'SportTech Pro', 'Velocity Energy', 'Gold Coast Finance', 'NorthStar Insurance',
+  'Atlas Telecom', 'Summit Brewing Co.', 'Pinnacle Sports Nutrition', 'Crown Automotive',
+  'Eclipse Apparel', 'Titan Construction', 'Meridian Healthcare', 'Horizon Media Group',
+  'Apex Travel', 'Sterling Watches', 'Nexus Gaming', 'BlueSky Airlines',
+] as const;
+
+/**
+ * Generate 2–3 sponsorship offers for the manager's club at the start of pre_season.
+ * Called once from handleInitLeague and once from processSeasonEnd.
+ * Guard: does nothing if offers already exist.
+ */
+function generateSponsorshipOffers(): void {
+  if (!state) return;
+  if ((state.sponsorshipOffers?.length ?? 0) > 0) return;
+
+  const playerClub = state.clubs[state.playerClubId];
+  if (!playerClub) return;
+
+  const tierFees: Record<string, number> = {
+    [Tier.EPL]:          5_000_000,
+    [Tier.Championship]: 1_500_000,
+    [Tier.LeagueOne]:    500_000,
+    [Tier.LeagueTwo]:    150_000,
+  };
+  const baseFee = tierFees[playerClub.currentTier] ?? 500_000;
+
+  const existingSponsors = new Set((state.activeSponsorships ?? []).map(s => s.sponsor));
+  const pool = (SPONSOR_NAMES as readonly string[]).filter(n => !existingSponsors.has(n));
+  const available = [...pool];
+
+  const count = 2 + (Math.random() < 0.5 ? 1 : 0);
+  const offers: SponsorshipOffer[] = [];
+
+  for (let i = 0; i < count && available.length > 0; i++) {
+    const idx     = Math.floor(Math.random() * available.length);
+    const sponsor = available.splice(idx, 1)[0];
+    const variation  = 0.6 + Math.random() * 0.8;
+    const annualFee  = Math.round(baseFee * variation / 10_000) * 10_000;
+    const duration   = 1 + Math.floor(Math.random() * 3);
+
+    offers.push({
+      id:              crypto.randomUUID(),
+      sponsor,
+      annualFee,
+      durationSeasons: duration,
+      requiresTier:    null,
+    });
+  }
+
+  if (!state.sponsorshipOffers) (state as any).sponsorshipOffers = [];
+  state.sponsorshipOffers = offers;
+  console.log(`[worker] Generated ${offers.length} sponsorship offers for season ${state.season}.`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Youth Academy & Retirement
+// ─────────────────────────────────────────────────────────────────────────────
+
 function retirementChance(age: number): number {
   if (age < 32) return 0;
   return Math.min(0.97, (age - 31) * 0.15 - 0.07);
 }
 
-// Small inline name pools for youth players — keeps the worker self-contained.
 const YOUTH_FIRST_NAMES = [
   'Alfie', 'Mason', 'Luca', 'Noah', 'Tyler', 'Kai', 'Logan', 'Ethan',
   'Oscar', 'Leo', 'Archie', 'Harry', 'Charlie', 'Theo', 'Riley', 'Finn',
@@ -225,26 +353,16 @@ const YOUTH_LAST_NAMES = [
   'Turner', 'Phillips', 'Scott', 'Adams', 'Hill', 'Wright',
 ];
 
-// Positions a youth player can be generated as — covers all roles.
 const YOUTH_POSITIONS: Position[] = [
   'GK', 'CB', 'LB', 'RB', 'CDM', 'CM', 'CAM', 'LW', 'RW', 'ST',
 ];
 
-/**
- * Generate a single youth academy player.
- *
- * Plain English: this creates a raw 16 or 17 year old. They're not good
- * enough to play yet (OVR 30–45) but have high potential (55–80), meaning
- * they can develop into solid players over several seasons.
- */
 function generateYouthPlayer(clubId: string): Player {
   const age            = Math.random() < 0.5 ? 16 : 17;
-  const currentAbility = 30 + Math.floor(Math.random() * 16);   // 30–45
-  const potential      = 55 + Math.floor(Math.random() * 26);   // 55–80
+  const currentAbility = 30 + Math.floor(Math.random() * 16);
+  const potential      = 55 + Math.floor(Math.random() * 26);
   const position       = YOUTH_POSITIONS[Math.floor(Math.random() * YOUTH_POSITIONS.length)];
 
-  // Attributes spread loosely around currentAbility with positional flavour.
-  // Using a simple ±8 random spread so attributes feel varied.
   const attr = (bias = 0): number =>
     Math.max(1, Math.min(99, currentAbility + bias + Math.round((Math.random() - 0.5) * 16)));
 
@@ -277,6 +395,7 @@ function generateYouthPlayer(clubId: string): Player {
     status:           'active',
     unavailableWeeks: 0,
     weeklyWage:       currentAbility * 200,
+    morale:           60,
     seasonStats: {
       appearances:   0,
       goals:         0,
@@ -290,43 +409,59 @@ function generateYouthPlayer(clubId: string): Player {
 }
 
 /**
- * End-of-season processing. Called once when all league fixtures are done.
+ * End-of-season processing.
  *
- * Order matters:
- *   1. Age all players +1 year
- *   2. Retire players probabilistically (older = higher chance)
- *   3. Clean up retired players from club tactics
- *   4. Top each club up to 20 players with youth academy intakes
- *   5. Recalculate all wage bills (squad composition changed)
- *   6. Clear stale transfer bids
- *   7. Advance season number + reset date/fixtures/standings
+ * Order:
+ *   1. Check if manager's club won the league → reputation + morale boost
+ *   2. Age all players +1
+ *   3. Retire players probabilistically
+ *   4. Clean up tactics
+ *   5. Youth intake
+ *   6. Return all loaned players to their original clubs
+ *   7. Recalculate all wage bills
+ *   8. Pay active sponsorships / expire old deals
+ *   9. Clear stale bids
+ *  10. Season rollover
+ *  11. Generate next pre-season sponsorship offers
+ *  12. Soft-reset morale toward 60
  */
 function processSeasonEnd(): void {
   if (!state) return;
 
-  console.log(`[worker] Season ${state.season} ending — processing retirement & youth intake…`);
+  console.log(`[worker] Season ${state.season} ending — processing…`);
 
-  // ── 1. Age all players ──────────────────────────────────────────────────
+  // ── 1. League win — reputation & morale ─────────────────────────────────
+  const playerTier = state.clubs[state.playerClubId]?.currentTier;
+  if (playerTier) {
+    const rows = (state.standings as Record<string, any[]>)[playerTier];
+    if (rows?.length > 0 && rows[0].clubId === state.playerClubId) {
+      (state as any).managerReputation = Math.min(100, (state.managerReputation ?? 50) + 10);
+      for (const player of Object.values(state.players)) {
+        if (player.clubId === state.playerClubId) {
+          (player as any).morale = Math.min(100, (player.morale ?? 60) + 10);
+        }
+      }
+      console.log('[worker] Manager won the league — reputation +10.');
+    }
+  }
+
+  // ── 2. Age all players ──────────────────────────────────────────────────
   for (const player of Object.values(state.players)) {
     (player as any).age += 1;
   }
 
-  // ── 2. Retire players ───────────────────────────────────────────────────
+  // ── 3. Retire players ───────────────────────────────────────────────────
   let retiredCount = 0;
   const retiredIds = new Set<string>();
-
   for (const player of Object.values(state.players)) {
     if (Math.random() < retirementChance(player.age)) {
       retiredIds.add(player.id);
       retiredCount++;
     }
   }
+  for (const id of retiredIds) delete state.players[id];
 
-  for (const id of retiredIds) {
-    delete state.players[id];
-  }
-
-  // ── 3. Clean up tactics — remove retired players from starting XIs ──────
+  // ── 4. Clean up tactics ─────────────────────────────────────────────────
   for (const club of Object.values(state.clubs)) {
     const xi    = club.tactics.startingXI.filter(id => !retiredIds.has(id));
     const bench = club.tactics.bench.filter(id => !retiredIds.has(id));
@@ -334,14 +469,12 @@ function processSeasonEnd(): void {
     (club.tactics as any).bench      = bench;
   }
 
-  // ── 4. Youth intake — top each club back up to 20 players ───────────────
+  // ── 5. Youth intake ─────────────────────────────────────────────────────
   let youthCount = 0;
-
   for (const club of Object.values(state.clubs)) {
     const currentSquadSize = Object.values(state.players)
       .filter(p => p.clubId === club.id).length;
     const needed = Math.max(0, 20 - currentSquadSize);
-
     for (let i = 0; i < needed; i++) {
       const youth = generateYouthPlayer(club.id);
       state.players[youth.id] = youth;
@@ -349,32 +482,68 @@ function processSeasonEnd(): void {
     }
   }
 
-  // ── 5. Recalculate all wage bills ────────────────────────────────────────
+  // ── 6. Return all loaned players ─────────────────────────────────────────
+  for (const loan of (state.activeLoans ?? [])) {
+    const player = state.players[loan.playerId];
+    if (player) {
+      (player as any).clubId = loan.lendingClubId;
+    }
+  }
+  state.activeLoans = [];
+
+  // ── 7. Recalculate all wage bills ────────────────────────────────────────
   for (const clubId of Object.keys(state.clubs)) {
     recalculateWageBill(clubId);
   }
 
-  // ── 6. Clear stale bids ──────────────────────────────────────────────────
-  state.pendingBids = [];
+  // ── 8. Pay active sponsorships, expire old deals ─────────────────────────
+  // Advance season first so we pay for the UPCOMING season.
+  state.season += 1;
 
-  // ── 7. Season rollover ───────────────────────────────────────────────────
-  state.season      += 1;
-  const newStartDate = `${state.season}-08-08`;
+  const newSponsorships: ActiveSponsorship[] = [];
+  for (const deal of (state.activeSponsorships ?? [])) {
+    if (deal.expiresAfterSeason >= state.season) {
+      // Deal still active — pay the annual fee
+      const manClub = state.clubs[state.playerClubId];
+      if (manClub) manClub.finances.balance += deal.annualFee;
+      newSponsorships.push(deal);
+    }
+    // Deals expired last season are silently dropped
+  }
+  state.activeSponsorships = newSponsorships;
+
+  // ── 9. Clear stale bids ──────────────────────────────────────────────────
+  state.pendingBids = [];
+  state.sponsorshipOffers = [];  // clear old offers (new ones generated below)
+
+  // ── 10. Season rollover ───────────────────────────────────────────────────
+  const newStartDate  = `${state.season}-08-08`;
   const newFixtureDate = `${state.season}-08-09`;
 
-  state.currentDate   = newStartDate;
-  state.lastUpdated   = newStartDate;
-  state.phase         = 'pre_season';
-  state.standings     = buildInitialStandings(state.clubs);
-  state.fixtures      = generateFixtures(state.clubs, newFixtureDate);
+  state.currentDate     = newStartDate;
+  state.lastUpdated     = newStartDate;
+  state.phase           = 'pre_season';
+  state.standings       = buildInitialStandings(state.clubs);
+  state.fixtures        = generateFixtures(state.clubs, newFixtureDate);
   state.playoffBrackets = {
     [Tier.EPL]: null, [Tier.Championship]: null,
     [Tier.LeagueOne]: null, [Tier.LeagueTwo]: null,
   };
 
+  // ── 11. Generate new pre-season sponsorship offers ───────────────────────
+  generateSponsorshipOffers();
+
+  // ── 12. Soft-reset morale toward 60 ──────────────────────────────────────
+  // Move each player's morale 30% of the way back to 60.
+  // Prevents morale snowballing across seasons.
+  for (const player of Object.values(state.players)) {
+    const current = player.morale ?? 60;
+    (player as any).morale = current + Math.round((60 - current) * 0.3);
+  }
+
   console.log(
-    `[worker] Season rollover complete. New season: ${state.season}. ` +
-    `Retired: ${retiredCount}. Youth intake: ${youthCount}.`
+    `[worker] Season rollover → ${state.season}. ` +
+    `Retired: ${retiredCount}. Youth: ${youthCount}.`
   );
 }
 
@@ -517,14 +686,27 @@ function getStartingXI(clubId: string): string[] {
     .map(p => p.id);
 }
 
+/**
+ * Returns average ability for a set of player IDs.
+ * Phase 7: morale applies a ±5% modifier on the result.
+ * Neutral at morale 50 (modifier = 1.0), 100 → 1.05, 0 → 0.95.
+ */
 function teamAbility(playerIds: string[]): number {
   if (!playerIds.length) return 50;
-  let total = 0, count = 0;
+  let totalAbility = 0, totalMorale = 0, count = 0;
   for (const id of playerIds) {
     const p = state!.players[id];
-    if (p) { total += p.currentAbility; count++; }
+    if (p) {
+      totalAbility += p.currentAbility;
+      totalMorale  += p.morale ?? 60;
+      count++;
+    }
   }
-  return count > 0 ? total / count : 50;
+  if (count === 0) return 50;
+  const avgAbility = totalAbility / count;
+  const avgMorale  = totalMorale  / count;
+  const moraleMod  = 1 + (avgMorale - 50) / 1000;  // ±5% at extremes
+  return avgAbility * moraleMod;
 }
 
 function pickScorer(playerIds: string[]): string | null {
@@ -685,8 +867,8 @@ function updateStandings(report: MatchReport, fixture: Fixture): void {
 }
 
 /**
- * Simulate all scheduled matches on a given date and return the reports.
- * Also adds matchday stadium revenue to the home club's balance.
+ * Simulate all scheduled matches on a given date.
+ * Phase 7: after each match, updates morale and (if relevant) manager reputation.
  */
 function simulateMatchesOnDate(date: string): MatchReport[] {
   const reports: MatchReport[] = [];
@@ -714,23 +896,20 @@ function simulateMatchesOnDate(date: string): MatchReport[] {
     }
 
     updateStandings(report, fixture);
+
+    // Phase 7 — morale & reputation updates
+    updateMoraleAfterMatch(report, fixture);
+    updateManagerReputation(report, fixture);
+
     reports.push(report);
   }
 
   return reports;
 }
 
-/**
- * Phase transition logic.
- *
- * pre_season      → regular_season : first match played
- * regular_season  → off_season      : all league fixtures complete
- * off_season is handled inside processSeasonEnd(), which resets to pre_season
- */
 function updatePhase(): void {
   if (!state) return;
 
-  // pre_season → regular_season once the first match is played
   if (state.phase === 'pre_season') {
     if (Object.values(state.fixtures).some(f => f.status === 'completed')) {
       state.phase = 'regular_season';
@@ -738,7 +917,6 @@ function updatePhase(): void {
     return;
   }
 
-  // regular_season → off_season once ALL league fixtures are done
   if (state.phase === 'regular_season') {
     const leagueFixtures = Object.values(state.fixtures).filter(
       f => f.context?.type === 'league'
@@ -747,14 +925,13 @@ function updatePhase(): void {
       leagueFixtures.every(f => f.status === 'completed');
 
     if (allComplete) {
-      // processSeasonEnd handles the full rollover and resets phase to pre_season
       processSeasonEnd();
     }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Action Handlers
+// Action Handlers — existing
 // ─────────────────────────────────────────────────────────────────────────────
 
 function handleInitLeague(action: {
@@ -788,13 +965,13 @@ function handleInitLeague(action: {
     const fixtures  = generateFixtures(clubs, firstFixtureDate);
 
     (state as any) = {
-      saveId:          crypto.randomUUID(),
-      saveName:        'New Game',
-      version:         '0.1.0',
+      saveId:             crypto.randomUUID(),
+      saveName:           'New Game',
+      version:            '0.1.0',
       seed,
       season,
-      currentDate:     startDate,
-      phase:           'pre_season',
+      currentDate:        startDate,
+      phase:              'pre_season',
       clubs,
       players,
       fixtures,
@@ -804,10 +981,17 @@ function handleInitLeague(action: {
         [Tier.LeagueOne]: null, [Tier.LeagueTwo]: null,
       },
       playerClubId,
-      nonLeagueClubIds: [],
-      pendingBids:      [],
-      lastUpdated:      startDate,
+      nonLeagueClubIds:   [],
+      pendingBids:        [],
+      managerReputation:  50,
+      sponsorshipOffers:  [],
+      activeSponsorships: [],
+      activeLoans:        [],
+      lastUpdated:        startDate,
     };
+
+    // Generate initial pre-season sponsorship offers
+    generateSponsorshipOffers();
 
     console.log('[worker] World generated:',
       Object.keys(clubs).length,   'clubs,',
@@ -1044,6 +1228,199 @@ function handleRejectBid(action: {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Action Handlers — Phase 7 additions
+// ─────────────────────────────────────────────────────────────────────────────
+
+function handleUpgradeStadium(action: {
+  type:    'UPGRADE_STADIUM';
+  jobId:   string;
+  payload: { capacityIncrease: number };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'UPGRADE_STADIUM')) return;
+
+  try {
+    const { capacityIncrease } = payload;
+    if (capacityIncrease <= 0 || capacityIncrease % 1000 !== 0) {
+      sendError(jobId, 'Capacity increase must be a positive multiple of 1,000.'); return;
+    }
+
+    const club = state.clubs[state.playerClubId];
+    if (!club) { sendError(jobId, 'Manager club not found'); return; }
+
+    const cost = stadiumUpgradeCost(club.stadiumCapacity, capacityIncrease);
+    if (club.finances.balance < cost) {
+      sendError(jobId, `Insufficient funds. Upgrade costs £${cost.toLocaleString()}.`); return;
+    }
+
+    club.finances.balance   -= cost;
+    club.stadiumCapacity    += capacityIncrease;
+    const revenuePerSeat     = REVENUE_PER_SEAT[club.currentTier] ?? 20;
+    club.finances.stadiumRevenue = Math.round(club.stadiumCapacity * revenuePerSeat);
+
+    state.lastUpdated = state.currentDate;
+    console.log(
+      `[worker] Stadium upgraded: +${capacityIncrease} seats → ` +
+      `${club.stadiumCapacity.toLocaleString()} total. Cost: £${cost.toLocaleString()}.`
+    );
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] UPGRADE_STADIUM crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function handleAcceptSponsorship(action: {
+  type:    'ACCEPT_SPONSORSHIP';
+  jobId:   string;
+  payload: { offerId: string };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'ACCEPT_SPONSORSHIP')) return;
+
+  try {
+    const offer = (state.sponsorshipOffers ?? []).find(o => o.id === payload.offerId);
+    if (!offer) { sendError(jobId, 'Sponsorship offer not found.'); return; }
+
+    const club = state.clubs[state.playerClubId];
+    if (!club) { sendError(jobId, 'Manager club not found.'); return; }
+
+    const newDeal: ActiveSponsorship = {
+      ...offer,
+      acceptedSeason:     state.season,
+      expiresAfterSeason: state.season + offer.durationSeasons - 1,
+    };
+
+    // Replace any existing sponsorship — one deal at a time
+    state.activeSponsorships = [newDeal];
+    // Clear all offers (decision made)
+    state.sponsorshipOffers  = [];
+    // Pay the first year immediately
+    club.finances.balance += offer.annualFee;
+
+    state.lastUpdated = state.currentDate;
+    console.log(
+      `[worker] Sponsorship accepted: ${offer.sponsor}, ` +
+      `£${offer.annualFee.toLocaleString()}/yr × ${offer.durationSeasons} seasons.`
+    );
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] ACCEPT_SPONSORSHIP crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function handleRejectSponsorship(action: {
+  type:    'REJECT_SPONSORSHIP';
+  jobId:   string;
+  payload: { offerId: string };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'REJECT_SPONSORSHIP')) return;
+
+  try {
+    state.sponsorshipOffers = (state.sponsorshipOffers ?? []).filter(
+      o => o.id !== payload.offerId
+    );
+    state.lastUpdated = state.currentDate;
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] REJECT_SPONSORSHIP crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function handleLoanInPlayer(action: {
+  type:    'LOAN_IN_PLAYER';
+  jobId:   string;
+  payload: { playerId: string; weeklyWageContribution: number };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'LOAN_IN_PLAYER')) return;
+
+  try {
+    const { playerId, weeklyWageContribution } = payload;
+    const player = state.players[playerId];
+
+    if (!player) { sendError(jobId, 'Player not found.'); return; }
+    if (player.clubId === state.playerClubId) { sendError(jobId, 'Player is already in your squad.'); return; }
+
+    // Check player isn't already on loan to someone else
+    const existingLoan = (state.activeLoans ?? []).find(l => l.playerId === playerId);
+    if (existingLoan) { sendError(jobId, 'Player is already involved in a loan.'); return; }
+
+    const originalClubId = player.clubId;
+    const loan: LoanRecord = {
+      id:                     crypto.randomUUID(),
+      playerId,
+      lendingClubId:          originalClubId,
+      borrowingClubId:        state.playerClubId,
+      weeklyWageContribution,
+      returnAfterSeason:      state.season,
+    };
+
+    if (!state.activeLoans) (state as any).activeLoans = [];
+    state.activeLoans.push(loan);
+    (player as any).clubId = state.playerClubId;
+
+    recalculateWageBill(state.playerClubId);
+    recalculateWageBill(originalClubId);
+
+    state.lastUpdated = state.currentDate;
+    console.log(`[worker] Loan in: ${player.name} from club ${originalClubId}.`);
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] LOAN_IN_PLAYER crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function handleLoanOutPlayer(action: {
+  type:    'LOAN_OUT_PLAYER';
+  jobId:   string;
+  payload: { playerId: string; toClubId: string; weeklyWageContribution: number };
+}): void {
+  const { jobId, payload } = action;
+  if (!requireState(jobId, 'LOAN_OUT_PLAYER')) return;
+
+  try {
+    const { playerId, toClubId, weeklyWageContribution } = payload;
+    const player = state.players[playerId];
+    const toClub = state.clubs[toClubId];
+
+    if (!player) { sendError(jobId, 'Player not found.'); return; }
+    if (!toClub) { sendError(jobId, 'Destination club not found.'); return; }
+    if (player.clubId !== state.playerClubId) { sendError(jobId, 'Player is not in your squad.'); return; }
+
+    const existingLoan = (state.activeLoans ?? []).find(l => l.playerId === playerId);
+    if (existingLoan) { sendError(jobId, 'Player is already involved in a loan.'); return; }
+
+    const loan: LoanRecord = {
+      id:                     crypto.randomUUID(),
+      playerId,
+      lendingClubId:          state.playerClubId,
+      borrowingClubId:        toClubId,
+      weeklyWageContribution,
+      returnAfterSeason:      state.season,
+    };
+
+    if (!state.activeLoans) (state as any).activeLoans = [];
+    state.activeLoans.push(loan);
+    (player as any).clubId = toClubId;
+
+    recalculateWageBill(state.playerClubId);
+    recalculateWageBill(toClubId);
+
+    state.lastUpdated = state.currentDate;
+    console.log(`[worker] Loan out: ${player.name} to ${toClub.name}.`);
+    sendSync(jobId);
+  } catch (err) {
+    console.error('[worker] LOAN_OUT_PLAYER crashed:', err);
+    sendError(jobId, err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Message Router
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1052,15 +1429,21 @@ self.onmessage = (event: MessageEvent) => {
   if (!action?.type) { console.warn('[worker] Received message with no type:', action); return; }
   console.log('[worker] Received action:', action.type, '| jobId:', action.jobId);
   switch (action.type) {
-    case 'INIT_LEAGUE':          handleInitLeague(action);          break;
-    case 'SIM_DAY':              handleSimDay(action);              break;
-    case 'SIM_TO_DATE':          handleSimToDate(action);           break;
-    case 'CANCEL_SIM':           handleCancelSim(action);           break;
-    case 'UPDATE_TACTICS':       handleUpdateTactics(action);       break;
-    case 'SAVE_GAME':            handleSaveGame(action);            break;
-    case 'MAKE_TRANSFER_OFFER':  handleMakeTransferOffer(action);   break;
-    case 'ACCEPT_BID':           handleAcceptBid(action);           break;
-    case 'REJECT_BID':           handleRejectBid(action);           break;
+    case 'INIT_LEAGUE':         handleInitLeague(action);         break;
+    case 'SIM_DAY':             handleSimDay(action);             break;
+    case 'SIM_TO_DATE':         handleSimToDate(action);          break;
+    case 'CANCEL_SIM':          handleCancelSim(action);          break;
+    case 'UPDATE_TACTICS':      handleUpdateTactics(action);      break;
+    case 'SAVE_GAME':           handleSaveGame(action);           break;
+    case 'MAKE_TRANSFER_OFFER': handleMakeTransferOffer(action);  break;
+    case 'ACCEPT_BID':          handleAcceptBid(action);          break;
+    case 'REJECT_BID':          handleRejectBid(action);          break;
+    // Phase 7
+    case 'UPGRADE_STADIUM':     handleUpgradeStadium(action);     break;
+    case 'ACCEPT_SPONSORSHIP':  handleAcceptSponsorship(action);  break;
+    case 'REJECT_SPONSORSHIP':  handleRejectSponsorship(action);  break;
+    case 'LOAN_IN_PLAYER':      handleLoanInPlayer(action);       break;
+    case 'LOAN_OUT_PLAYER':     handleLoanOutPlayer(action);      break;
     default:
       console.warn('[worker] Unknown action type:', action.type);
       if (action.jobId) sendError(action.jobId, `Unknown action type: ${action.type}`);

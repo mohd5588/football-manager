@@ -155,7 +155,7 @@ export type PlayerStatus = "active" | "injured" | "suspended" | "regen";
 
 export interface Player {
   readonly id:          EntityId;
-  /** Mutable — changes on transfer. */
+  /** Mutable — changes on transfer or loan. */
   clubId:               EntityId;
   readonly name:        string;
   /** Mutable — increments each season during off_season. */
@@ -170,6 +170,12 @@ export interface Player {
   readonly unavailableWeeks: number;
   /** Weekly wage in GBP. */
   weeklyWage:           number;
+  /**
+   * Player morale (0–100). Affects match-engine lambda by ±5%.
+   * Rises after wins/promotions; drops after losses/poor form.
+   * Soft-resets toward 60 each off-season.
+   */
+  morale:               number;
   /** Season stats accumulated so far. */
   readonly seasonStats: PlayerSeasonStats;
 }
@@ -210,7 +216,7 @@ export interface ClubFinances {
   balance:        number;  // GBP
   wageBill:       number;  // per week GBP (sum of all player weeklyWage)
   transferBudget: number;  // GBP
-  stadiumRevenue: number;  // per match day GBP
+  stadiumRevenue: number;  // per match day GBP — recalculated from stadiumCapacity
 }
 
 export interface Club {
@@ -226,6 +232,12 @@ export interface Club {
   readonly finances: ClubFinances;
   /** Whether this club is controlled by the human player. */
   isPlayerManaged:  boolean;
+  /**
+   * Stadium seating capacity. Drives matchday revenue.
+   * Upgradeable via UPGRADE_STADIUM action.
+   * Tier defaults: EPL ~40k, Championship ~20k, League One ~10k, League Two ~6k.
+   */
+  stadiumCapacity:  number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -326,6 +338,60 @@ export interface TransferBid {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// § 5c · SPONSORSHIP & LOANS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A sponsorship offer generated at the start of pre_season.
+ * The manager can accept one offer per season.
+ */
+export interface SponsorshipOffer {
+  readonly id:              EntityId;
+  readonly sponsor:         string;
+  /** Annual payment into the club's balance (GBP). */
+  readonly annualFee:       number;
+  /** How many seasons the deal runs if accepted. */
+  readonly durationSeasons: number;
+  /**
+   * The minimum tier required to receive payment each season.
+   * null = any tier (the sponsor stays regardless of division).
+   */
+  readonly requiresTier:    Tier | null;
+}
+
+/**
+ * An accepted sponsorship deal. Extends SponsorshipOffer with
+ * the season it was signed and the last season it pays out.
+ */
+export interface ActiveSponsorship extends SponsorshipOffer {
+  readonly acceptedSeason:     number;
+  /** Sponsorship pays through to the END of this season. */
+  readonly expiresAfterSeason: number;
+}
+
+/**
+ * Tracks a loan move — either a player borrowed in from an AI club,
+ * or one of the manager's players loaned out to an AI club.
+ *
+ * Plain English:
+ *   lendingClubId   = the club that OWNS the player (they get them back).
+ *   borrowingClubId = the club temporarily USING the player.
+ *
+ * During the loan, player.clubId equals borrowingClubId.
+ * At season end processSeasonEnd() resets player.clubId → lendingClubId.
+ */
+export interface LoanRecord {
+  readonly id:                     EntityId;
+  readonly playerId:               EntityId;
+  readonly lendingClubId:          EntityId;
+  readonly borrowingClubId:        EntityId;
+  /** Amount the borrowing club contributes toward wages per week (GBP). */
+  readonly weeklyWageContribution: number;
+  /** The loan expires at the end of this season number. */
+  readonly returnAfterSeason:      number;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // § 6 · THE AUTHORITATIVE GAME STATE (lives in the Worker)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -361,6 +427,17 @@ export interface SerializedGameState {
   nonLeagueClubIds:    EntityId[];
   /** Pending AI bids for the manager's players. */
   pendingBids:         TransferBid[];
+  /**
+   * Manager career reputation (0–100). Starts at 50.
+   * Rises: league wins, promotions. Falls: relegations, heavy defeats.
+   */
+  managerReputation:   number;
+  /** Sponsorship offers available to accept during pre_season. */
+  sponsorshipOffers:   SponsorshipOffer[];
+  /** Active sponsorship deals (annual fee paid each season). */
+  activeSponsorships:  ActiveSponsorship[];
+  /** All current loan records (in and out). Cleared each off_season. */
+  activeLoans:         LoanRecord[];
   lastUpdated:         ISODateString;
 }
 
@@ -462,6 +539,64 @@ export interface RejectBidAction extends BaseAction {
   };
 }
 
+/**
+ * Manager upgrades their club's stadium capacity.
+ * Cost = stadiumCapacity * 100 (GBP, deducted from balance).
+ * Revenue is recalculated from the new capacity.
+ */
+export interface UpgradeStadiumAction extends BaseAction {
+  readonly type:    "UPGRADE_STADIUM";
+  readonly payload: {
+    /** Number of seats to add (must be a positive multiple of 1000). */
+    capacityIncrease: number;
+  };
+}
+
+/** Manager accepts one of the pre_season sponsorship offers. */
+export interface AcceptSponsorshipAction extends BaseAction {
+  readonly type:    "ACCEPT_SPONSORSHIP";
+  readonly payload: {
+    offerId: EntityId;
+  };
+}
+
+/** Manager dismisses a sponsorship offer without accepting it. */
+export interface RejectSponsorshipAction extends BaseAction {
+  readonly type:    "REJECT_SPONSORSHIP";
+  readonly payload: {
+    offerId: EntityId;
+  };
+}
+
+/**
+ * Manager loans in a player from an AI club for the season.
+ * No transfer fee. player.clubId changes to the manager's club
+ * and reverts at season end.
+ */
+export interface LoanInPlayerAction extends BaseAction {
+  readonly type:    "LOAN_IN_PLAYER";
+  readonly payload: {
+    playerId:               EntityId;
+    /** Weekly contribution (GBP) the manager pays toward the player's wage. */
+    weeklyWageContribution: number;
+  };
+}
+
+/**
+ * Manager loans one of their players out to an AI club for the season.
+ * player.clubId changes to the AI club and reverts at season end.
+ */
+export interface LoanOutPlayerAction extends BaseAction {
+  readonly type:    "LOAN_OUT_PLAYER";
+  readonly payload: {
+    playerId:               EntityId;
+    /** The AI club receiving the player on loan. */
+    toClubId:               EntityId;
+    /** Weekly contribution (GBP) the AI club pays toward the player's wage. */
+    weeklyWageContribution: number;
+  };
+}
+
 export type WorkerAction =
   | InitLeagueAction
   | SimDayAction
@@ -471,7 +606,12 @@ export type WorkerAction =
   | SaveGameAction
   | MakeTransferOfferAction
   | AcceptBidAction
-  | RejectBidAction;
+  | RejectBidAction
+  | UpgradeStadiumAction
+  | AcceptSponsorshipAction
+  | RejectSponsorshipAction
+  | LoanInPlayerAction
+  | LoanOutPlayerAction;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 8 · WORKER RESPONSE CONTRACT (Worker → Main Thread)
@@ -618,6 +758,12 @@ export interface ISimulationService {
   exportSnapshot():                                 Promise<string>;
   importSnapshot(json: string, slotIndex: SaveSlotMeta["slotIndex"]): Promise<SaveSlotMeta>;
   listSaveSlots():                                  Promise<SaveSlotMeta[]>;
+  // Phase 7 additions
+  upgradeStadium(capacityIncrease: number):         Promise<void>;
+  acceptSponsorship(offerId: EntityId):             Promise<void>;
+  rejectSponsorship(offerId: EntityId):             Promise<void>;
+  loanInPlayer(playerId: EntityId, weeklyWageContribution: number): Promise<void>;
+  loanOutPlayer(playerId: EntityId, toClubId: EntityId, weeklyWageContribution: number): Promise<void>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

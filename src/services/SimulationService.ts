@@ -4,10 +4,14 @@
  * The sole bridge between UI components and the Web Worker.
  * Components call methods on this service — they never touch postMessage.
  *
- * Phase 6 Part 2 additions:
- *   ✅ checkForSeasonRollover — detects when state.season increments and
- *      fires a 'youth_intake' AttentionEvent so the simulation pauses and
- *      the manager is directed to the Squad tab to review new academy players
+ * Phase 7 additions:
+ *   ✅ checkForSponsorshipOffers — detects new pre-season sponsorship offers
+ *      and fires an AttentionEvent so the simulation pauses for the manager.
+ *   ✅ upgradeStadium        — sends UPGRADE_STADIUM to the worker
+ *   ✅ acceptSponsorship     — sends ACCEPT_SPONSORSHIP, fires success toast
+ *   ✅ rejectSponsorship     — sends REJECT_SPONSORSHIP
+ *   ✅ loanInPlayer          — sends LOAN_IN_PLAYER, fires success toast
+ *   ✅ loanOutPlayer         — sends LOAN_OUT_PLAYER, fires success toast
  */
 
 import { workerBridge } from './workerBridge';
@@ -33,21 +37,12 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * The worker sends state as `response.state`.
- * types.ts declares it as `response.payload`.
- * This function handles both so nothing breaks either way.
- */
 function extractState(response: WorkerResponse): SerializedGameState | null {
   const r   = response as Record<string, unknown>;
   const raw = (r.state ?? r.payload) as SerializedGameState | undefined;
   return raw ?? null;
 }
 
-/**
- * Convert the raw SerializedGameState (arrives from the worker) into
- * the ClientGameState shape that Zustand and the UI components use.
- */
 function toClientState(raw: SerializedGameState): ClientGameState {
   const playerClub =
     raw.clubs[raw.playerClubId] ??
@@ -72,12 +67,17 @@ function toClientState(raw: SerializedGameState): ClientGameState {
 
   return {
     ...raw,
-    pendingBids:        raw.pendingBids ?? [],
-    playerClub:         playerClub!,
+    // Graceful defaults for fields missing on saves from earlier phases
+    pendingBids:         raw.pendingBids        ?? [],
+    managerReputation:   raw.managerReputation  ?? 50,
+    sponsorshipOffers:   raw.sponsorshipOffers  ?? [],
+    activeSponsorships:  raw.activeSponsorships ?? [],
+    activeLoans:         raw.activeLoans        ?? [],
+    playerClub:          playerClub!,
     nextFixture,
     playerStandingsRow,
-    isSimulating:       false,
-    simulationProgress: 0,
+    isSimulating:        false,
+    simulationProgress:  0,
   };
 }
 
@@ -88,43 +88,34 @@ function toClientState(raw: SerializedGameState): ClientGameState {
 class SimulationService {
   private currentJobId: string | null = null;
 
-  /**
-   * Tracks bid IDs we've already raised as AttentionEvents.
-   * Prevents the same bid triggering the inbox banner on every SYNC_STATE.
-   * Reset when a new game is started or loaded.
-   */
+  /** Prevents duplicate AttentionEvents for the same bid. */
   private processedBidIds = new Set<string>();
 
   /**
    * Tracks the last season number we observed.
-   *
-   * When state.season increments past this value we know the worker just
-   * ran processSeasonEnd() and we should fire the youth intake banner.
-   *
-   * Initialised to 0 so the very first SYNC_STATE after a new/loaded game
-   * just sets the baseline without firing an event (season 2025 > 0 is true
-   * but we guard against that with the === 0 check).
+   * Used to detect season rollovers and fire youth-intake AttentionEvents.
    */
   private lastKnownSeason = 0;
 
+  /**
+   * Tracks sponsorship offer IDs we've already raised an AttentionEvent for.
+   * Prevents the same offer triggering the inbox banner multiple times.
+   */
+  private processedSponsorshipOfferIds = new Set<string>();
+
   constructor() {
-    // ── Single unified worker-message handler ──────────────────────────
-    //
-    // IMPORTANT: register onSyncState ONCE only. Two registrations silently
-    // replace each other and break the Zustand update path.
     workerBridge.onSyncState((response: WorkerResponse) => {
 
-      // ── SYNC_STATE: push new world state into Zustand ──────────────
       if (isSyncStateResponse(response)) {
         const raw = extractState(response);
         if (raw) {
           this.checkForNewBids(raw);
           this.checkForSeasonRollover(raw);
+          this.checkForSponsorshipOffers(raw);
           this.applyGameState(raw);
         }
       }
 
-      // ── MATCH_RESULT: route report to the inbox ─────────────────────
       if (isMatchResultResponse(response)) {
         const r      = response as Record<string, unknown>;
         const report = (r.payload ?? r.report) as Record<string, unknown> | undefined;
@@ -141,19 +132,8 @@ class SimulationService {
 
   // ─── Season rollover detection ──────────────────────────────────────────
 
-  /**
-   * Called after every SYNC_STATE. Compares the incoming season number
-   * against the last one we saw. If it's gone up, the worker just finished
-   * processSeasonEnd() — fire a youth intake AttentionEvent so the simulation
-   * pauses and the manager is sent to the Squad tab to see their new players.
-   *
-   * The lastKnownSeason === 0 guard prevents a spurious event on the very
-   * first SYNC_STATE after a new game or load (where season jumps from 0
-   * to e.g. 2025).
-   */
   private checkForSeasonRollover(state: SerializedGameState): void {
     if (this.lastKnownSeason === 0) {
-      // First sync — just record the baseline season, don't fire anything.
       this.lastKnownSeason = state.season;
       return;
     }
@@ -161,7 +141,6 @@ class SimulationService {
     if (state.season > this.lastKnownSeason) {
       this.lastKnownSeason = state.season;
 
-      // Count academy players (age ≤ 17) in the manager's squad
       const academyPlayers = Object.values(state.players).filter(
         p => p.clubId === state.playerClubId && p.age <= 17
       );
@@ -182,13 +161,40 @@ class SimulationService {
     }
   }
 
-  // ─── Bid detection ──────────────────────────────────────────────────────
+  // ─── Sponsorship offer detection ────────────────────────────────────────
 
   /**
-   * After every SYNC_STATE, scan pendingBids for new entries that target
-   * one of the manager's players. For each new bid, push an AttentionEvent
-   * so the simulation pauses and the manager is prompted to review the offer.
+   * Called after every SYNC_STATE during pre_season.
+   * Detects newly generated sponsorship offers and fires one AttentionEvent
+   * covering all of them so the simulation pauses for the manager's decision.
    */
+  private checkForSponsorshipOffers(state: SerializedGameState): void {
+    if (state.phase !== 'pre_season') return;
+    const offers = state.sponsorshipOffers ?? [];
+    if (offers.length === 0) return;
+
+    const newOffers = offers.filter(o => !this.processedSponsorshipOfferIds.has(o.id));
+    if (newOffers.length === 0) return;
+
+    for (const o of newOffers) {
+      this.processedSponsorshipOfferIds.add(o.id);
+    }
+
+    import('../store/inboxStore').then(({ useInboxStore }) => {
+      useInboxStore.getState().pushAttention({
+        id:              `sponsorship_offers_${state.season}`,
+        type:            'sponsorship_offer',
+        title:           'New Sponsorship Offers',
+        body:            `You have ${newOffers.length} new sponsorship offer${newOffers.length !== 1 ? 's' : ''} to review. Head to the Dashboard to see the deals available for season ${state.season}.`,
+        primaryAction:   'Review offers',
+        secondaryAction: 'Later',
+        primaryTab:      'dashboard',
+      });
+    });
+  }
+
+  // ─── Bid detection ──────────────────────────────────────────────────────
+
   private checkForNewBids(state: SerializedGameState): void {
     const pendingBids = state.pendingBids ?? [];
     for (const bid of pendingBids) {
@@ -224,7 +230,8 @@ class SimulationService {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
     this.processedBidIds.clear();
-    this.lastKnownSeason = 0; // reset so first SYNC_STATE sets baseline cleanly
+    this.processedSponsorshipOfferIds.clear();
+    this.lastKnownSeason = 0;
 
     try {
       const response = await workerBridge.send({
@@ -346,7 +353,8 @@ class SimulationService {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
     this.processedBidIds.clear();
-    this.lastKnownSeason = 0; // reset so first SYNC_STATE after load sets baseline
+    this.processedSponsorshipOfferIds.clear();
+    this.lastKnownSeason = 0;
 
     try {
       const record = await readSaveSlot(slotIndex);
@@ -475,6 +483,134 @@ class SimulationService {
       import('../store/inboxStore').then(({ useInboxStore }) => {
         useInboxStore.getState().resolveAttention(bidId);
       });
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  // ─── Phase 7: Stadium Upgrades ──────────────────────────────────────────
+
+  async upgradeStadium(capacityIncrease: number): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+
+    try {
+      await workerBridge.send({
+        type:    'UPGRADE_STADIUM',
+        payload: { capacityIncrease },
+      });
+
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          `Stadium expanded by ${capacityIncrease.toLocaleString()} seats!`,
+          'success'
+        );
+      });
+    } catch (err) {
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          err instanceof Error ? err.message : 'Upgrade failed.',
+          'error'
+        );
+      });
+      throw err;
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  // ─── Phase 7: Sponsorships ──────────────────────────────────────────────
+
+  async acceptSponsorship(offerId: string): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+    this.processedSponsorshipOfferIds.delete(offerId); // allow re-display if re-generated
+
+    try {
+      await workerBridge.send({
+        type:    'ACCEPT_SPONSORSHIP',
+        payload: { offerId },
+      });
+
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast('Sponsorship deal signed!', 'success');
+      });
+    } catch (err) {
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          err instanceof Error ? err.message : 'Could not accept sponsorship.',
+          'error'
+        );
+      });
+      throw err;
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  async rejectSponsorship(offerId: string): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+
+    try {
+      await workerBridge.send({
+        type:    'REJECT_SPONSORSHIP',
+        payload: { offerId },
+      });
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  // ─── Phase 7: Loan Market ───────────────────────────────────────────────
+
+  async loanInPlayer(playerId: string, weeklyWageContribution: number): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+
+    try {
+      await workerBridge.send({
+        type:    'LOAN_IN_PLAYER',
+        payload: { playerId, weeklyWageContribution },
+      });
+
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast('Player joined on loan!', 'success');
+      });
+    } catch (err) {
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          err instanceof Error ? err.message : 'Loan failed.',
+          'error'
+        );
+      });
+      throw err;
+    } finally {
+      useGameStore.getState().setSimulating(false);
+    }
+  }
+
+  async loanOutPlayer(playerId: string, toClubId: string, weeklyWageContribution: number): Promise<void> {
+    const { useGameStore } = await import('../store/gameStore');
+    useGameStore.getState().setSimulating(true);
+
+    try {
+      await workerBridge.send({
+        type:    'LOAN_OUT_PLAYER',
+        payload: { playerId, toClubId, weeklyWageContribution },
+      });
+
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast('Player loaned out successfully!', 'success');
+      });
+    } catch (err) {
+      import('../store/uiStore').then(({ useUiStore }) => {
+        useUiStore.getState().pushToast(
+          err instanceof Error ? err.message : 'Loan out failed.',
+          'error'
+        );
+      });
+      throw err;
     } finally {
       useGameStore.getState().setSimulating(false);
     }
