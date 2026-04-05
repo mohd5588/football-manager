@@ -7,6 +7,11 @@
  *   Left  — Pending decisions (attention events)
  *   Right — Match reports, always single column, keyboard-navigable
  *
+ * Unread vs read styling:
+ *   Unread — white background tint, blue-500 left border, bold team names,
+ *            "NEW" badge top-right, score in full white
+ *   Read   — dark/muted, zinc-700 left border, dimmed team names
+ *
  * Keyboard navigation (↑ / ↓):
  *   - Moves the focused card up or down
  *   - Auto-scrolls the focused card into view
@@ -48,18 +53,22 @@ function relativeTime(iso: string): string {
 // xG bar
 // ---------------------------------------------------------------------------
 
-function XgBar({ homeXg, awayXg }: { homeXg: number; awayXg: number }) {
+function XgBar({ homeXg, awayXg, unread }: { homeXg: number; awayXg: number; unread: boolean }) {
   const total = homeXg + awayXg
   if (total === 0) return null
   const homePct = Math.round((homeXg / total) * 100)
   return (
     <div className="flex items-center gap-1.5 mt-2">
-      <span className="text-[10px] text-zinc-500 w-7 text-right tabular-nums">{homeXg.toFixed(1)}</span>
+      <span className={`text-[10px] w-7 text-right tabular-nums ${unread ? 'text-zinc-400' : 'text-zinc-600'}`}>
+        {homeXg.toFixed(1)}
+      </span>
       <div className="flex-1 flex rounded-full overflow-hidden h-1.5">
         <div className="bg-blue-500" style={{ width: `${homePct}%` }} />
         <div className="bg-orange-400" style={{ width: `${100 - homePct}%` }} />
       </div>
-      <span className="text-[10px] text-zinc-500 w-7 tabular-nums">{awayXg.toFixed(1)}</span>
+      <span className={`text-[10px] w-7 tabular-nums ${unread ? 'text-zinc-400' : 'text-zinc-600'}`}>
+        {awayXg.toFixed(1)}
+      </span>
       <span className="text-[10px] text-zinc-600">xG</span>
     </div>
   )
@@ -78,8 +87,10 @@ interface MatchCardProps {
 function MatchCard({ item, isSelected, cardRef }: MatchCardProps) {
   const gameState    = useGameStore(selectGameState)
   const selectPlayer = useUiStore((s) => s.selectPlayer)
+  const markRead     = useInboxStore((s) => s.markRead)
 
   const { report } = item
+  const unread   = !item.isRead
   const homeClub = gameState?.clubs[report.homeStats.clubId]
   const awayClub = gameState?.clubs[report.awayStats.clubId]
 
@@ -92,82 +103,106 @@ function MatchCard({ item, isSelected, cardRef }: MatchCardProps) {
     .filter((e) => e.type === 'goal')
     .sort((a, b) => a.minute - b.minute)
 
+  // Card container styles — unread is visually loud, read is clearly dimmed
+  const cardClass = isSelected
+    ? 'border-blue-500 ring-2 ring-blue-500/30 bg-zinc-900'
+    : unread
+      ? 'border-l-4 border-l-blue-500 border-t border-r border-b border-zinc-700 bg-zinc-800/80 shadow-lg'
+      : 'border border-zinc-800 bg-zinc-900/40 opacity-60'
+
   return (
     <div
       ref={cardRef}
-      className={`rounded-xl border transition-all ${
-        isSelected
-          ? 'border-blue-500 ring-2 ring-blue-500/40 bg-zinc-900'
-          : item.isRead
-            ? 'bg-zinc-900/50 border-zinc-800'
-            : 'bg-zinc-900 border-zinc-700 shadow-md'
-      }`}
+      onClick={() => unread && markRead(report.fixtureId)}
+      className={`rounded-xl transition-all ${cardClass} ${unread ? 'cursor-pointer hover:opacity-90' : ''}`}
     >
       {/* Score header */}
       <div className="px-4 pt-4 pb-3">
-        {/* Selected indicator */}
-        {isSelected && (
-          <div className="flex items-center gap-1.5 mb-2">
-            <span className="w-1 h-1 rounded-full bg-blue-500" />
-            <span className="text-[10px] text-blue-400 font-medium">Focused</span>
-          </div>
-        )}
+
+        {/* Top row: focused indicator (left) + NEW badge or timestamp (right) */}
+        <div className="flex items-center justify-between mb-2">
+          {isSelected ? (
+            <span className="text-[10px] text-blue-400 font-medium flex items-center gap-1">
+              <span className="w-1 h-1 rounded-full bg-blue-500 inline-block" />
+              Focused
+            </span>
+          ) : (
+            <span />
+          )}
+          {unread ? (
+            <span className="bg-blue-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full tracking-wide">
+              NEW
+            </span>
+          ) : (
+            <span className="text-[10px] text-zinc-600">{relativeTime(item.receivedAt)}</span>
+          )}
+        </div>
+
+        {/* Teams + score */}
         <div className="flex items-center justify-between gap-3">
-          <span className={`flex-1 text-sm truncate ${
-            homeGoals > awayGoals ? 'text-white font-semibold' : 'text-zinc-500'
+          <span className={`flex-1 truncate ${
+            homeGoals > awayGoals
+              ? unread ? 'text-white font-bold text-sm' : 'text-zinc-400 font-semibold text-sm'
+              : unread ? 'text-zinc-300 text-sm' : 'text-zinc-600 text-sm'
           }`}>
             {homeClub?.name ?? '?'}
           </span>
           <div className="flex items-center gap-2 flex-shrink-0">
-            <span className={`text-xl font-bold tabular-nums ${
-              homeGoals > awayGoals ? 'text-white' : 'text-zinc-400'
+            <span className={`text-2xl font-bold tabular-nums ${
+              homeGoals > awayGoals
+                ? unread ? 'text-white' : 'text-zinc-300'
+                : unread ? 'text-zinc-300' : 'text-zinc-500'
             }`}>{homeGoals}</span>
-            <span className="text-zinc-600 text-sm">–</span>
-            <span className={`text-xl font-bold tabular-nums ${
-              awayGoals > homeGoals ? 'text-white' : 'text-zinc-400'
+            <span className={`text-sm ${unread ? 'text-zinc-500' : 'text-zinc-700'}`}>–</span>
+            <span className={`text-2xl font-bold tabular-nums ${
+              awayGoals > homeGoals
+                ? unread ? 'text-white' : 'text-zinc-300'
+                : unread ? 'text-zinc-300' : 'text-zinc-500'
             }`}>{awayGoals}</span>
           </div>
-          <span className={`flex-1 text-sm text-right truncate ${
-            awayGoals > homeGoals ? 'text-white font-semibold' : 'text-zinc-500'
+          <span className={`flex-1 text-right truncate ${
+            awayGoals > homeGoals
+              ? unread ? 'text-white font-bold text-sm' : 'text-zinc-400 font-semibold text-sm'
+              : unread ? 'text-zinc-300 text-sm' : 'text-zinc-600 text-sm'
           }`}>
             {awayClub?.name ?? '?'}
           </span>
         </div>
-        <XgBar homeXg={report.homeStats.xG} awayXg={report.awayStats.xG} />
+
+        <XgBar homeXg={report.homeStats.xG} awayXg={report.awayStats.xG} unread={unread} />
       </div>
 
       {/* Goal scorers */}
       {goalEvents.length > 0 && (
-        <div className="px-4 py-2 border-t border-zinc-800 flex flex-wrap gap-x-4 gap-y-0.5">
+        <div className={`px-4 py-2 border-t ${unread ? 'border-zinc-700' : 'border-zinc-800'} flex flex-wrap gap-x-4 gap-y-0.5`}>
           {goalEvents.map((e, i) => {
             const player = gameState?.players[e.playerId]
             const club   = gameState?.clubs[e.clubId]
             return (
               <button
                 key={i}
-                onClick={() => player && selectPlayer(player.id)}
-                className="text-[11px] text-zinc-400 hover:text-white transition-colors"
+                onClick={(ev) => { ev.stopPropagation(); player && selectPlayer(player.id) }}
+                className={`text-[11px] transition-colors hover:text-white ${unread ? 'text-zinc-300' : 'text-zinc-600'}`}
               >
                 ⚽ {player?.name?.split(' ').pop() ?? '?'} {e.minute}′
-                <span className="text-zinc-600 ml-0.5">({club?.shortName ?? '?'})</span>
+                <span className={`ml-0.5 ${unread ? 'text-zinc-500' : 'text-zinc-700'}`}>
+                  ({club?.shortName ?? '?'})
+                </span>
               </button>
             )
           })}
         </div>
       )}
 
-      {/* Narrative + timestamp */}
-      {(narrative || !item.isRead) && (
-        <div className="px-4 py-2.5 border-t border-zinc-800 flex items-start justify-between gap-3">
-          {narrative && (
-            <p className="text-xs text-zinc-500 leading-relaxed flex-1">{narrative}</p>
+      {/* Narrative + read timestamp */}
+      {narrative && (
+        <div className={`px-4 py-2.5 border-t ${unread ? 'border-zinc-700' : 'border-zinc-800'} flex items-start justify-between gap-3`}>
+          <p className={`text-xs leading-relaxed flex-1 ${unread ? 'text-zinc-400' : 'text-zinc-600'}`}>
+            {narrative}
+          </p>
+          {!unread && (
+            <span className="text-[10px] text-zinc-700 flex-shrink-0">{relativeTime(item.receivedAt)}</span>
           )}
-          <div className="flex items-center gap-2 flex-shrink-0">
-            {!item.isRead && (
-              <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
-            )}
-            <span className="text-[10px] text-zinc-600">{relativeTime(item.receivedAt)}</span>
-          </div>
         </div>
       )}
     </div>
@@ -251,13 +286,11 @@ export default function InboxView() {
   const [selectedIndex, setSelectedIndex] = useState(0)
   const cardRefs = useRef<(HTMLDivElement | null)[]>([])
 
-  // Clamp selectedIndex whenever the list length changes
   useEffect(() => {
     if (matchReports.length === 0) return
     setSelectedIndex((i) => Math.min(i, matchReports.length - 1))
   }, [matchReports.length])
 
-  // Auto-mark as read + scroll into view whenever selection changes
   useEffect(() => {
     const item = matchReports[selectedIndex]
     if (!item) return
@@ -265,7 +298,6 @@ export default function InboxView() {
     cardRefs.current[selectedIndex]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   }, [selectedIndex]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Arrow key handler — only active when inbox tab is open and no input focused
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     if (matchReports.length === 0) return
     const tag = (e.target as HTMLElement).tagName.toLowerCase()
