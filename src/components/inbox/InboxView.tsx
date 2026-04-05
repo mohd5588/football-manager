@@ -1,18 +1,20 @@
 /**
  * src/components/inbox/InboxView.tsx
  *
- * Full-screen inbox — replaces the old narrow right-side drawer.
+ * Full-screen inbox.
  *
- * Layout (two columns on wide screens):
- *   Left  — Pending decisions: attention events that need a manager response
- *            (transfer bids, youth intake notices, etc.)
- *   Right — Match reports: one card per completed game involving your club,
- *            showing score, scorers, xG bar, and a narrative summary.
+ * Layout:
+ *   Left  — Pending decisions (attention events)
+ *   Right — Match reports, always single column, keyboard-navigable
  *
- * On narrow screens both columns stack vertically.
+ * Keyboard navigation (↑ / ↓):
+ *   - Moves the focused card up or down
+ *   - Auto-scrolls the focused card into view
+ *   - Auto-marks focused card as read
+ *   - Only fires when no input/button is focused
  */
 
-import React, { useState } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
   useInboxStore,
   selectInboxItems,
@@ -24,7 +26,7 @@ import {
 import { useGameStore, selectGameState } from '../../store/gameStore'
 import { useUiStore } from '../../store/uiStore'
 import { simulationService } from '../../services/SimulationService'
-import type { MatchEvent, NavTab } from '../../types'
+import type { NavTab } from '../../types'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -67,9 +69,14 @@ function XgBar({ homeXg, awayXg }: { homeXg: number; awayXg: number }) {
 // Match report card
 // ---------------------------------------------------------------------------
 
-function MatchCard({ item }: { item: InboxItem }) {
+interface MatchCardProps {
+  item:       InboxItem
+  isSelected: boolean
+  cardRef:    (el: HTMLDivElement | null) => void
+}
+
+function MatchCard({ item, isSelected, cardRef }: MatchCardProps) {
   const gameState    = useGameStore(selectGameState)
-  const markRead     = useInboxStore((s) => s.markRead)
   const selectPlayer = useUiStore((s) => s.selectPlayer)
 
   const { report } = item
@@ -78,7 +85,7 @@ function MatchCard({ item }: { item: InboxItem }) {
 
   const homeGoals = report.homeStats.goals
   const awayGoals = report.awayStats.goals
-  const [_, ...narrativeRest] = report.narrativeSummary ?? []
+  const [, ...narrativeRest] = report.narrativeSummary ?? []
   const narrative = narrativeRest.join(' ')
 
   const goalEvents = [...report.events]
@@ -87,15 +94,24 @@ function MatchCard({ item }: { item: InboxItem }) {
 
   return (
     <div
-      onClick={() => markRead(report.fixtureId)}
-      className={`rounded-xl border transition-colors cursor-default ${
-        item.isRead
-          ? 'bg-zinc-900/50 border-zinc-800'
-          : 'bg-zinc-900 border-zinc-700 shadow-md'
+      ref={cardRef}
+      className={`rounded-xl border transition-all ${
+        isSelected
+          ? 'border-blue-500 ring-2 ring-blue-500/40 bg-zinc-900'
+          : item.isRead
+            ? 'bg-zinc-900/50 border-zinc-800'
+            : 'bg-zinc-900 border-zinc-700 shadow-md'
       }`}
     >
       {/* Score header */}
       <div className="px-4 pt-4 pb-3">
+        {/* Selected indicator */}
+        {isSelected && (
+          <div className="flex items-center gap-1.5 mb-2">
+            <span className="w-1 h-1 rounded-full bg-blue-500" />
+            <span className="text-[10px] text-blue-400 font-medium">Focused</span>
+          </div>
+        )}
         <div className="flex items-center justify-between gap-3">
           <span className={`flex-1 text-sm truncate ${
             homeGoals > awayGoals ? 'text-white font-semibold' : 'text-zinc-500'
@@ -129,7 +145,7 @@ function MatchCard({ item }: { item: InboxItem }) {
             return (
               <button
                 key={i}
-                onClick={(ev) => { ev.stopPropagation(); player && selectPlayer(player.id) }}
+                onClick={() => player && selectPlayer(player.id)}
                 className="text-[11px] text-zinc-400 hover:text-white transition-colors"
               >
                 ⚽ {player?.name?.split(' ').pop() ?? '?'} {e.minute}′
@@ -159,7 +175,7 @@ function MatchCard({ item }: { item: InboxItem }) {
 }
 
 // ---------------------------------------------------------------------------
-// Attention event card (pending decisions)
+// Attention event card
 // ---------------------------------------------------------------------------
 
 function AttentionCard({ event }: { event: AttentionEvent }) {
@@ -168,17 +184,16 @@ function AttentionCard({ event }: { event: AttentionEvent }) {
   const [busy, setBusy]  = useState(false)
 
   const ICON: Record<string, string> = {
-    transfer_offer: '💰',
-    youth_intake:   '🌱',
-    injury_update:  '🏥',
-    contract_expiry:'📄',
-    board_message:  '📢',
+    transfer_offer:  '💰',
+    youth_intake:    '🌱',
+    injury_update:   '🏥',
+    contract_expiry: '📄',
+    board_message:   '📢',
   }
   const icon = ICON[event.type] ?? '📋'
 
   async function handlePrimary() {
     resolveAttention(event.id)
-    // If the event is a transfer bid rejection, also call rejectBid
     if (event.type === 'transfer_offer') {
       setBusy(true)
       try { await simulationService.rejectBid(event.id) } catch {}
@@ -228,9 +243,46 @@ export default function InboxView() {
   const unreadCount    = useInboxStore(selectUnreadCount)
   const attentionQueue = useInboxStore(selectAttentionQueue)
   const markAllRead    = useInboxStore((s) => s.markAllRead)
+  const markRead       = useInboxStore((s) => s.markRead)
 
-  // Only show match reports (items with a real fixtureId)
   const matchReports = items.filter((i) => !!i.report?.fixtureId)
+
+  // ── Keyboard navigation state ─────────────────────────────────────────
+  const [selectedIndex, setSelectedIndex] = useState(0)
+  const cardRefs = useRef<(HTMLDivElement | null)[]>([])
+
+  // Clamp selectedIndex whenever the list length changes
+  useEffect(() => {
+    if (matchReports.length === 0) return
+    setSelectedIndex((i) => Math.min(i, matchReports.length - 1))
+  }, [matchReports.length])
+
+  // Auto-mark as read + scroll into view whenever selection changes
+  useEffect(() => {
+    const item = matchReports[selectedIndex]
+    if (!item) return
+    if (!item.isRead) markRead(item.report.fixtureId)
+    cardRefs.current[selectedIndex]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [selectedIndex]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Arrow key handler — only active when inbox tab is open and no input focused
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (matchReports.length === 0) return
+    const tag = (e.target as HTMLElement).tagName.toLowerCase()
+    if (['input', 'textarea', 'select', 'button'].includes(tag)) return
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setSelectedIndex((i) => Math.min(i + 1, matchReports.length - 1))
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setSelectedIndex((i) => Math.max(i - 1, 0))
+    }
+  }, [matchReports.length])
+
+  useEffect(() => {
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [handleKeyDown])
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -285,14 +337,23 @@ export default function InboxView() {
           )}
         </div>
 
-        {/* ── Right column: Match reports ──────────────────────────── */}
+        {/* ── Right column: Match reports (always single column) ───── */}
         <div className="flex-1 min-w-0">
-          <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-widest mb-3">
-            Match reports
-            {matchReports.length > 0 && (
-              <span className="ml-2 text-zinc-600">{matchReports.length}</span>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-widest">
+              Match reports
+              {matchReports.length > 0 && (
+                <span className="ml-2 text-zinc-600">{matchReports.length}</span>
+              )}
+            </h2>
+            {matchReports.length > 1 && (
+              <span className="text-[10px] text-zinc-600 flex items-center gap-1">
+                <kbd className="px-1 py-0.5 rounded bg-zinc-800 text-zinc-500 font-mono">↑</kbd>
+                <kbd className="px-1 py-0.5 rounded bg-zinc-800 text-zinc-500 font-mono">↓</kbd>
+                to navigate
+              </span>
             )}
-          </h2>
+          </div>
 
           {matchReports.length === 0 ? (
             <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl px-4 py-12 text-center">
@@ -304,9 +365,14 @@ export default function InboxView() {
               </p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-              {matchReports.map((item) => (
-                <MatchCard key={item.report.fixtureId} item={item} />
+            <div className="space-y-3">
+              {matchReports.map((item, idx) => (
+                <MatchCard
+                  key={item.report.fixtureId}
+                  item={item}
+                  isSelected={idx === selectedIndex}
+                  cardRef={(el) => { cardRefs.current[idx] = el }}
+                />
               ))}
             </div>
           )}
