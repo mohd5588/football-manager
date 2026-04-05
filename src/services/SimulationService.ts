@@ -4,15 +4,13 @@
  * The sole bridge between UI components and the Web Worker.
  * Components call methods on this service — they never touch postMessage.
  *
- * Phase 6 additions:
- *   ✅ makeTransferOffer  — manager buys a player from an AI club
- *   ✅ acceptBid          — manager sells a player to an AI club
- *   ✅ rejectBid          — manager declines a bid, clears it from state
- *   ✅ Bid detection      — after every SYNC_STATE, check for new incoming
- *                          bids and push an AttentionEvent so simulation pauses
+ * Phase 6 Part 2 additions:
+ *   ✅ checkForSeasonRollover — detects when state.season increments and
+ *      fires a 'youth_intake' AttentionEvent so the simulation pauses and
+ *      the manager is directed to the Squad tab to review new academy players
  */
 
-import workerBridge from './workerBridge';
+import { workerBridge } from './workerBridge';
 import {
   type SerializedGameState,
   type ClientGameState,
@@ -97,6 +95,18 @@ class SimulationService {
    */
   private processedBidIds = new Set<string>();
 
+  /**
+   * Tracks the last season number we observed.
+   *
+   * When state.season increments past this value we know the worker just
+   * ran processSeasonEnd() and we should fire the youth intake banner.
+   *
+   * Initialised to 0 so the very first SYNC_STATE after a new/loaded game
+   * just sets the baseline without firing an event (season 2025 > 0 is true
+   * but we guard against that with the === 0 check).
+   */
+  private lastKnownSeason = 0;
+
   constructor() {
     // ── Single unified worker-message handler ──────────────────────────
     //
@@ -109,6 +119,7 @@ class SimulationService {
         const raw = extractState(response);
         if (raw) {
           this.checkForNewBids(raw);
+          this.checkForSeasonRollover(raw);
           this.applyGameState(raw);
         }
       }
@@ -128,6 +139,49 @@ class SimulationService {
     console.log('[SimulationService] Ready ✅');
   }
 
+  // ─── Season rollover detection ──────────────────────────────────────────
+
+  /**
+   * Called after every SYNC_STATE. Compares the incoming season number
+   * against the last one we saw. If it's gone up, the worker just finished
+   * processSeasonEnd() — fire a youth intake AttentionEvent so the simulation
+   * pauses and the manager is sent to the Squad tab to see their new players.
+   *
+   * The lastKnownSeason === 0 guard prevents a spurious event on the very
+   * first SYNC_STATE after a new game or load (where season jumps from 0
+   * to e.g. 2025).
+   */
+  private checkForSeasonRollover(state: SerializedGameState): void {
+    if (this.lastKnownSeason === 0) {
+      // First sync — just record the baseline season, don't fire anything.
+      this.lastKnownSeason = state.season;
+      return;
+    }
+
+    if (state.season > this.lastKnownSeason) {
+      this.lastKnownSeason = state.season;
+
+      // Count academy players (age ≤ 17) in the manager's squad
+      const academyPlayers = Object.values(state.players).filter(
+        p => p.clubId === state.playerClubId && p.age <= 17
+      );
+      const count = academyPlayers.length;
+      const label = count === 1 ? '1 new player' : `${count} new players`;
+
+      import('../store/inboxStore').then(({ useInboxStore }) => {
+        useInboxStore.getState().pushAttention({
+          id:              `youth_intake_${state.season}`,
+          type:            'youth_intake',
+          title:           `Season ${state.season} — Pre-Season`,
+          body:            `The youth academy has delivered ${label} to your squad. Head to the Squad tab and filter by Academy to see who came through.`,
+          primaryAction:   'View squad',
+          secondaryAction: 'Continue',
+          primaryTab:      'squad',
+        });
+      });
+    }
+  }
+
   // ─── Bid detection ──────────────────────────────────────────────────────
 
   /**
@@ -138,10 +192,8 @@ class SimulationService {
   private checkForNewBids(state: SerializedGameState): void {
     const pendingBids = state.pendingBids ?? [];
     for (const bid of pendingBids) {
-      // Skip bids we've already shown
       if (this.processedBidIds.has(bid.id)) continue;
 
-      // Only react to bids targeting the manager's squad
       const player = state.players[bid.playerId];
       if (!player || player.clubId !== state.playerClubId) continue;
 
@@ -171,7 +223,8 @@ class SimulationService {
   async initLeague(config: WorldGenConfig): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
-    this.processedBidIds.clear(); // fresh game = fresh bid history
+    this.processedBidIds.clear();
+    this.lastKnownSeason = 0; // reset so first SYNC_STATE sets baseline cleanly
 
     try {
       const response = await workerBridge.send({
@@ -292,7 +345,8 @@ class SimulationService {
   async loadGame(slotIndex: number): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
-    this.processedBidIds.clear(); // loaded save = fresh bid detection history
+    this.processedBidIds.clear();
+    this.lastKnownSeason = 0; // reset so first SYNC_STATE after load sets baseline
 
     try {
       const record = await readSaveSlot(slotIndex);
@@ -354,10 +408,6 @@ class SimulationService {
 
   // ─── Transfer Market ────────────────────────────────────────────────────
 
-  /**
-   * Manager buys a player from an AI club.
-   * The worker handles: deducting the fee, moving the player, recalculating wages.
-   */
   async makeTransferOffer(playerId: string, fee: number, weeklyWage: number): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
@@ -384,15 +434,10 @@ class SimulationService {
     }
   }
 
-  /**
-   * Manager accepts an AI club's bid for one of their players.
-   * The worker handles: crediting the fee, moving the player, recalculating wages.
-   * The bid is also removed from processedBidIds so it won't re-trigger.
-   */
   async acceptBid(bidId: string): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
-    this.processedBidIds.delete(bidId); // allow the bid to be cleaned up cleanly
+    this.processedBidIds.delete(bidId);
 
     try {
       await workerBridge.send({
@@ -416,10 +461,6 @@ class SimulationService {
     }
   }
 
-  /**
-   * Manager rejects an AI bid — removes it from state and dismisses
-   * any attention event associated with it.
-   */
   async rejectBid(bidId: string): Promise<void> {
     const { useGameStore } = await import('../store/gameStore');
     useGameStore.getState().setSimulating(true);
@@ -431,7 +472,6 @@ class SimulationService {
         payload: { bidId },
       });
 
-      // Also clear the attention event if it's still in the queue
       import('../store/inboxStore').then(({ useInboxStore }) => {
         useInboxStore.getState().resolveAttention(bidId);
       });
