@@ -9,6 +9,15 @@
  *   ✅ ACCEPT_BID — manager accepts an AI club's offer for their player
  *   ✅ REJECT_BID — manager rejects a bid, removes it from pendingBids
  *   ✅ recalculateWageBill() keeps club.finances.wageBill accurate after transfers
+ *
+ * Phase 6 Part 2 additions:
+ *   ✅ Probabilistic retirement — chance rises steeply from age 32, peaks ~97% at 38+
+ *      Outliers can play to 39–40 but it's rare. No hard cutoff.
+ *   ✅ Age increment — all players gain 1 year at season end
+ *   ✅ Youth academy — each club topped up to 20 players with 16–17 year olds
+ *      (currentAbility 30–45, potential 55–80) after retirement processing
+ *   ✅ Season rollover — standings reset, new fixtures generated, season++ on
+ *      transition to off_season once all league matches are complete
  */
 
 import {
@@ -21,6 +30,8 @@ import {
   type ClubMatchStats,
   type PlayerMatchRating,
   type TransferBid,
+  type Player,
+  type Position,
 } from '../types';
 import { generateWorld } from './engine/worldGen';
 
@@ -127,12 +138,6 @@ function processEndOfDay(date: string): void {
 /**
  * Generate AI transfer bids targeting the manager's best players.
  * Called on the 1st of each month during regular_season.
- *
- * Logic:
- *  - Any manager player with ability > tierMean + 5 is "attractive"
- *  - Each attractive player has a 20% chance of receiving a bid
- *  - Maximum 2 new bids generated per month
- *  - A player already receiving a bid is skipped
  */
 function generateAIBids(): void {
   if (!state) return;
@@ -147,7 +152,6 @@ function generateAIBids(): void {
     p => p.clubId === playerClubId && p.status === 'active'
   );
 
-  // Players that are above average for their tier — attractive to other clubs
   const attractive = myPlayers.filter(p => p.currentAbility > tierMean + 5);
   if (attractive.length === 0) return;
 
@@ -158,18 +162,12 @@ function generateAIBids(): void {
 
   for (const player of attractive) {
     if (bidsThisMonth >= 2) break;
-
-    // 20% chance per player
     if (Math.random() > 0.2) continue;
 
-    // Skip if there's already a pending bid for this player
     const existingBid = (state.pendingBids ?? []).find(b => b.playerId === player.id);
     if (existingBid) continue;
 
-    // Pick a random AI club
-    const fromClub = otherClubs[Math.floor(Math.random() * otherClubs.length)];
-
-    // Bid fee formula from spec
+    const fromClub  = otherClubs[Math.floor(Math.random() * otherClubs.length)];
     const ageFactor = player.age <= 24 ? 1.5 : player.age <= 29 ? 1.0 : 0.6;
     const fee       = Math.round(player.currentAbility * ageFactor * 100_000);
 
@@ -186,6 +184,198 @@ function generateAIBids(): void {
     state.pendingBids.push(bid);
     bidsThisMonth++;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Youth Academy & Retirement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Retirement probability curve.
+ *
+ * Plain English: players aged under 32 never retire at season end.
+ * From 32 onwards the chance climbs steeply — most players are gone by 37,
+ * but a small number of outliers can play into their late 30s / early 40s.
+ *
+ * Age → chance:
+ *   32 →  8%   (rare early retirement)
+ *   33 → 23%
+ *   34 → 38%
+ *   35 → 53%   (more than half retire at 35)
+ *   36 → 68%
+ *   37 → 83%
+ *   38 → 97%   (capped — almost certain, but a tiny chance of one more year)
+ *   39+ → 97%
+ */
+function retirementChance(age: number): number {
+  if (age < 32) return 0;
+  return Math.min(0.97, (age - 31) * 0.15 - 0.07);
+}
+
+// Small inline name pools for youth players — keeps the worker self-contained.
+const YOUTH_FIRST_NAMES = [
+  'Alfie', 'Mason', 'Luca', 'Noah', 'Tyler', 'Kai', 'Logan', 'Ethan',
+  'Oscar', 'Leo', 'Archie', 'Harry', 'Charlie', 'Theo', 'Riley', 'Finn',
+  'Jude', 'Zak', 'Dylan', 'Connor', 'Rhys', 'Callum', 'Jamie', 'Aaron',
+];
+
+const YOUTH_LAST_NAMES = [
+  'Smith', 'Jones', 'Williams', 'Taylor', 'Brown', 'Davies', 'Evans',
+  'Wilson', 'Roberts', 'Clark', 'Walker', 'Hall', 'Green', 'Baker',
+  'Turner', 'Phillips', 'Scott', 'Adams', 'Hill', 'Wright',
+];
+
+// Positions a youth player can be generated as — covers all roles.
+const YOUTH_POSITIONS: Position[] = [
+  'GK', 'CB', 'LB', 'RB', 'CDM', 'CM', 'CAM', 'LW', 'RW', 'ST',
+];
+
+/**
+ * Generate a single youth academy player.
+ *
+ * Plain English: this creates a raw 16 or 17 year old. They're not good
+ * enough to play yet (OVR 30–45) but have high potential (55–80), meaning
+ * they can develop into solid players over several seasons.
+ */
+function generateYouthPlayer(clubId: string): Player {
+  const age            = Math.random() < 0.5 ? 16 : 17;
+  const currentAbility = 30 + Math.floor(Math.random() * 16);   // 30–45
+  const potential      = 55 + Math.floor(Math.random() * 26);   // 55–80
+  const position       = YOUTH_POSITIONS[Math.floor(Math.random() * YOUTH_POSITIONS.length)];
+
+  // Attributes spread loosely around currentAbility with positional flavour.
+  // Using a simple ±8 random spread so attributes feel varied.
+  const attr = (bias = 0): number =>
+    Math.max(1, Math.min(99, currentAbility + bias + Math.round((Math.random() - 0.5) * 16)));
+
+  const isGK  = position === 'GK';
+  const isDef = ['CB', 'LB', 'RB'].includes(position);
+  const isMid = ['CDM', 'CM', 'CAM'].includes(position);
+  const isFwd = ['LW', 'RW', 'ST'].includes(position);
+
+  const firstName = YOUTH_FIRST_NAMES[Math.floor(Math.random() * YOUTH_FIRST_NAMES.length)];
+  const lastName  = YOUTH_LAST_NAMES[Math.floor(Math.random() * YOUTH_LAST_NAMES.length)];
+
+  return {
+    id:              crypto.randomUUID(),
+    clubId,
+    name:            `${firstName} ${lastName}`,
+    age,
+    position,
+    attributes: {
+      pace:         isFwd ? attr(6)  : isDef ? attr(-4) : attr(),
+      finishing:    isFwd ? attr(8)  : isGK  ? attr(-18): attr(-4),
+      passing:      isMid ? attr(6)  : isGK  ? attr(-4) : attr(),
+      dribbling:    isFwd || isMid ? attr(4) : attr(-6),
+      defending:    isDef ? attr(8)  : isFwd ? attr(-8) : attr(-2),
+      physical:     attr(2),
+      goalkeeping:  isGK  ? attr(12) : attr(-22),
+      intelligence: attr(),
+    },
+    currentAbility,
+    potential,
+    status:           'active',
+    unavailableWeeks: 0,
+    weeklyWage:       currentAbility * 200,
+    seasonStats: {
+      appearances:   0,
+      goals:         0,
+      assists:       0,
+      cleanSheets:   0,
+      yellowCards:   0,
+      redCards:      0,
+      averageRating: 0,
+    },
+  };
+}
+
+/**
+ * End-of-season processing. Called once when all league fixtures are done.
+ *
+ * Order matters:
+ *   1. Age all players +1 year
+ *   2. Retire players probabilistically (older = higher chance)
+ *   3. Clean up retired players from club tactics
+ *   4. Top each club up to 20 players with youth academy intakes
+ *   5. Recalculate all wage bills (squad composition changed)
+ *   6. Clear stale transfer bids
+ *   7. Advance season number + reset date/fixtures/standings
+ */
+function processSeasonEnd(): void {
+  if (!state) return;
+
+  console.log(`[worker] Season ${state.season} ending — processing retirement & youth intake…`);
+
+  // ── 1. Age all players ──────────────────────────────────────────────────
+  for (const player of Object.values(state.players)) {
+    (player as any).age += 1;
+  }
+
+  // ── 2. Retire players ───────────────────────────────────────────────────
+  let retiredCount = 0;
+  const retiredIds = new Set<string>();
+
+  for (const player of Object.values(state.players)) {
+    if (Math.random() < retirementChance(player.age)) {
+      retiredIds.add(player.id);
+      retiredCount++;
+    }
+  }
+
+  for (const id of retiredIds) {
+    delete state.players[id];
+  }
+
+  // ── 3. Clean up tactics — remove retired players from starting XIs ──────
+  for (const club of Object.values(state.clubs)) {
+    const xi    = club.tactics.startingXI.filter(id => !retiredIds.has(id));
+    const bench = club.tactics.bench.filter(id => !retiredIds.has(id));
+    (club.tactics as any).startingXI = xi;
+    (club.tactics as any).bench      = bench;
+  }
+
+  // ── 4. Youth intake — top each club back up to 20 players ───────────────
+  let youthCount = 0;
+
+  for (const club of Object.values(state.clubs)) {
+    const currentSquadSize = Object.values(state.players)
+      .filter(p => p.clubId === club.id).length;
+    const needed = Math.max(0, 20 - currentSquadSize);
+
+    for (let i = 0; i < needed; i++) {
+      const youth = generateYouthPlayer(club.id);
+      state.players[youth.id] = youth;
+      youthCount++;
+    }
+  }
+
+  // ── 5. Recalculate all wage bills ────────────────────────────────────────
+  for (const clubId of Object.keys(state.clubs)) {
+    recalculateWageBill(clubId);
+  }
+
+  // ── 6. Clear stale bids ──────────────────────────────────────────────────
+  state.pendingBids = [];
+
+  // ── 7. Season rollover ───────────────────────────────────────────────────
+  state.season      += 1;
+  const newStartDate = `${state.season}-08-08`;
+  const newFixtureDate = `${state.season}-08-09`;
+
+  state.currentDate   = newStartDate;
+  state.lastUpdated   = newStartDate;
+  state.phase         = 'pre_season';
+  state.standings     = buildInitialStandings(state.clubs);
+  state.fixtures      = generateFixtures(state.clubs, newFixtureDate);
+  state.playoffBrackets = {
+    [Tier.EPL]: null, [Tier.Championship]: null,
+    [Tier.LeagueOne]: null, [Tier.LeagueTwo]: null,
+  };
+
+  console.log(
+    `[worker] Season rollover complete. New season: ${state.season}. ` +
+    `Retired: ${retiredCount}. Youth intake: ${youthCount}.`
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -358,7 +548,7 @@ function simulateMatch(fixture: Fixture): MatchReport {
   const homeAbility = teamAbility(homeXI);
   const awayAbility = teamAbility(awayXI);
 
-  const homeLambda = (homeAbility / 100) * 2.0 * 1.15; // home advantage
+  const homeLambda = (homeAbility / 100) * 2.0 * 1.15;
   const awayLambda = (awayAbility / 100) * 1.8;
 
   const homeGoals = poissonRandom(homeLambda);
@@ -517,8 +707,6 @@ function simulateMatchesOnDate(date: string): MatchReport[] {
       attendance,
     };
 
-    // ── Matchday revenue: home club earns 70–100% of their stadiumRevenue ──
-    // Plain English: bigger crowds (random variation) mean more ticket income.
     const homeClub = state!.clubs[fixture.homeClubId];
     if (homeClub) {
       const attendanceMod = 0.7 + Math.random() * 0.3;
@@ -532,10 +720,36 @@ function simulateMatchesOnDate(date: string): MatchReport[] {
   return reports;
 }
 
+/**
+ * Phase transition logic.
+ *
+ * pre_season      → regular_season : first match played
+ * regular_season  → off_season      : all league fixtures complete
+ * off_season is handled inside processSeasonEnd(), which resets to pre_season
+ */
 function updatePhase(): void {
-  if (!state || state.phase !== 'pre_season') return;
-  if (Object.values(state.fixtures).some(f => f.status === 'completed')) {
-    state.phase = 'regular_season';
+  if (!state) return;
+
+  // pre_season → regular_season once the first match is played
+  if (state.phase === 'pre_season') {
+    if (Object.values(state.fixtures).some(f => f.status === 'completed')) {
+      state.phase = 'regular_season';
+    }
+    return;
+  }
+
+  // regular_season → off_season once ALL league fixtures are done
+  if (state.phase === 'regular_season') {
+    const leagueFixtures = Object.values(state.fixtures).filter(
+      f => f.context?.type === 'league'
+    );
+    const allComplete = leagueFixtures.length > 0 &&
+      leagueFixtures.every(f => f.status === 'completed');
+
+    if (allComplete) {
+      // processSeasonEnd handles the full rollover and resets phase to pre_season
+      processSeasonEnd();
+    }
   }
 }
 
@@ -591,7 +805,7 @@ function handleInitLeague(action: {
       },
       playerClubId,
       nonLeagueClubIds: [],
-      pendingBids:      [],   // ← Phase 6: initialise empty bid list
+      pendingBids:      [],
       lastUpdated:      startDate,
     };
 
@@ -734,12 +948,6 @@ function handleSaveGame(action: {
   }
 }
 
-/**
- * Manager buys a player from an AI club.
- * Deducts fee from manager's transferBudget + balance.
- * Adds fee to selling club's balance.
- * Moves player to manager's squad and recalculates both wage bills.
- */
 function handleMakeTransferOffer(action: {
   type:    'MAKE_TRANSFER_OFFER';
   jobId:   string;
@@ -761,18 +969,13 @@ function handleMakeTransferOffer(action: {
     const sellingClubId = player.clubId;
     const sellingClub   = state.clubs[sellingClubId];
 
-    // Deduct from manager's budget and balance
     managerClub.finances.transferBudget -= fee;
     managerClub.finances.balance        -= fee;
-
-    // Credit the selling club
     if (sellingClub) sellingClub.finances.balance += fee;
 
-    // Move player and set new wage
     (player as any).clubId     = state.playerClubId;
     (player as any).weeklyWage = weeklyWage;
 
-    // Recalculate both clubs' wage bills
     recalculateWageBill(state.playerClubId);
     if (sellingClub) recalculateWageBill(sellingClubId);
 
@@ -784,11 +987,6 @@ function handleMakeTransferOffer(action: {
   }
 }
 
-/**
- * Manager accepts an AI bid for one of their players.
- * Credits fee to manager's balance + transferBudget.
- * Moves player to the buying club.
- */
 function handleAcceptBid(action: {
   type:    'ACCEPT_BID';
   jobId:   string;
@@ -807,22 +1005,15 @@ function handleAcceptBid(action: {
 
     if (!player) { sendError(jobId, 'Player not found'); return; }
 
-    // Credit the manager
     if (managerClub) {
       managerClub.finances.balance        += bid.fee;
       managerClub.finances.transferBudget += bid.fee;
     }
-
-    // Deduct from buying club
     if (buyClub) buyClub.finances.balance -= bid.fee;
 
-    // Move player
     (player as any).clubId = bid.fromClubId;
-
-    // Remove this bid from the list
     state.pendingBids = (state.pendingBids ?? []).filter(b => b.id !== bid.id);
 
-    // Recalculate wage bills for both clubs
     recalculateWageBill(state.playerClubId);
     if (buyClub) recalculateWageBill(buyClub.id);
 
@@ -834,7 +1025,6 @@ function handleAcceptBid(action: {
   }
 }
 
-/** Manager rejects a bid — just removes it from the pending list. */
 function handleRejectBid(action: {
   type:    'REJECT_BID';
   jobId:   string;
